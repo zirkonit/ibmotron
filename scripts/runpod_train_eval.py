@@ -64,6 +64,14 @@ def _include_path(path: Path) -> bool:
     return not any(normalized.startswith(prefix) for prefix in EXCLUDE_PARTS)
 
 
+def _normalize_tarinfo(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    return info
+
+
 def build_archive(archive_path: Path, *, dataset_name: str) -> Path:
     include_paths = [*INCLUDE_PATHS, f"artifacts/datasets/{dataset_name}"]
     with tarfile.open(archive_path, "w:gz") as tar:
@@ -72,16 +80,62 @@ def build_archive(archive_path: Path, *, dataset_name: str) -> Path:
             if not target.exists():
                 continue
             if target.is_file():
-                tar.add(target, arcname=f"ibmotron/{relative}")
+                tar.add(target, arcname=f"ibmotron/{relative}", filter=_normalize_tarinfo)
                 continue
             for path in target.rglob("*"):
                 if not path.exists() or not _include_path(path.relative_to(REPO_ROOT)):
                     continue
-                tar.add(path, arcname=f"ibmotron/{path.relative_to(REPO_ROOT)}")
+                tar.add(path, arcname=f"ibmotron/{path.relative_to(REPO_ROOT)}", filter=_normalize_tarinfo)
     return archive_path
 
 
 def remote_train_command(args: argparse.Namespace, remote_output: str) -> str:
+    if args.run_mode == "overfit-sanity":
+        dataset_index = args.dataset_index or f"artifacts/datasets/{args.dataset_name}/splits/synthetic_train.jsonl"
+        return " && ".join(
+            [
+                "export DEBIAN_FRONTEND=noninteractive",
+                "apt-get update",
+                "apt-get install -y build-essential git python3-pip python3-venv",
+                "mkdir -p /workspace",
+                "rm -rf /workspace/ibmotron",
+                "tar --no-same-owner --no-same-permissions -xzf /workspace/ibmotron.tgz -C /workspace",
+                "cd /workspace/ibmotron",
+                "python3 -m venv .venv --system-site-packages",
+                ". .venv/bin/activate",
+                "export HF_HOME=/workspace/.cache/huggingface",
+                "mkdir -p \"$HF_HOME\"",
+                "python -m pip install --upgrade pip",
+                "pip install -e \".[dev]\"",
+                (
+                    "pip install "
+                    f"accelerate=={ACCELERATE_VERSION} "
+                    f"bitsandbytes=={BITSANDBYTES_VERSION} "
+                    f"datasets=={DATASETS_VERSION} "
+                    f"peft=={PEFT_VERSION} "
+                    f"transformers=={TRANSFORMERS_VERSION}"
+                ),
+                f"pip install {MAMBA_WHEEL_URL}",
+                f"pip install {CAUSAL_CONV1D_WHEEL_URL}",
+                "./scripts/build_simh.sh",
+                (
+                    "python -m ibm650_it.cli overfit-sanity "
+                    f"--dataset-index {dataset_index} "
+                    f"--output {remote_output} "
+                    f"--example-count {args.example_count} "
+                    f"--backend {args.backend} "
+                    f"--model-name {args.model_name} "
+                    f"--qlora-bits {args.qlora_bits} "
+                    f"--epochs {args.epochs} "
+                    f"--max-seq-length {args.max_seq_length} "
+                    f"--per-device-train-batch-size {args.per_device_train_batch_size} "
+                    f"--gradient-accumulation-steps {args.gradient_accumulation_steps} "
+                    f"--max-new-tokens {args.max_new_tokens} "
+                    f"--failure-archive-limit {args.failure_archive_limit} "
+                    f"--timeout-seconds {args.timeout_seconds}"
+                ).strip(),
+            ]
+        )
     return " && ".join(
         [
             "export DEBIAN_FRONTEND=noninteractive",
@@ -89,7 +143,7 @@ def remote_train_command(args: argparse.Namespace, remote_output: str) -> str:
             "apt-get install -y build-essential git python3-pip python3-venv",
             "mkdir -p /workspace",
             "rm -rf /workspace/ibmotron",
-            "tar -xzf /workspace/ibmotron.tgz -C /workspace",
+            "tar --no-same-owner --no-same-permissions -xzf /workspace/ibmotron.tgz -C /workspace",
             "cd /workspace/ibmotron",
             "python3 -m venv .venv --system-site-packages",
             ". .venv/bin/activate",
@@ -134,10 +188,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", default="ibmotron-runpod-train")
     parser.add_argument("--pod-id")
+    parser.add_argument("--run-mode", choices=["train-eval", "overfit-sanity"], default="train-eval")
     parser.add_argument("--gpu-id", default="NVIDIA RTX A6000")
     parser.add_argument("--cloud-type", default="COMMUNITY")
     parser.add_argument("--image", default="runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404")
     parser.add_argument("--dataset-name", default="pilot_1000")
+    parser.add_argument("--dataset-index")
     parser.add_argument("--backend", default="transformers_qlora")
     parser.add_argument("--model-name", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
     parser.add_argument("--qlora-bits", type=int, default=4)
@@ -153,6 +209,7 @@ def main() -> None:
     parser.add_argument("--timeout-seconds", type=int, default=30)
     parser.add_argument("--remote-output", default="artifacts/eval_reports/runpod_train_eval")
     parser.add_argument("--local-output", default="artifacts/eval_reports/runpod_train_eval")
+    parser.add_argument("--example-count", type=int, default=32)
     parser.add_argument("--keep-pod", action="store_true")
     args = parser.parse_args()
 
