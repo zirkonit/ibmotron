@@ -7,7 +7,10 @@ from pathlib import Path
 from ibm650_it import REPO_ROOT
 from ibm650_it.dataset.build_records import build_record
 from ibm650_it.dataset.corpus import build_pilot_corpus, parse_band_counts
-from ibm650_it.eval.report import build_evaluation_report
+from ibm650_it.dataset.subset import slice_dataset
+from ibm650_it.eval.archive import archive_failures
+from ibm650_it.eval.report import build_evaluation_report, compare_mode_reports
+from ibm650_it.eval.research_report import write_research_report
 from ibm650_it.generate.sample_program import generate_accepted_programs, generate_band_program
 from ibm650_it.pit.normalize_pit import canonicalize_pit_file
 from ibm650_it.simh.runner import SimhRunner
@@ -124,6 +127,7 @@ def cmd_prepare_sft(args: argparse.Namespace) -> None:
     records = prepare_sft_examples(
         dataset_index=Path(args.dataset_index),
         output_path=Path(args.output),
+        limit=args.limit,
     )
     _print_json({"records_written": records, "output": args.output})
 
@@ -135,6 +139,20 @@ def cmd_build_pilot_corpus(args: argparse.Namespace) -> None:
         workers=args.workers,
         max_attempts_per_band=args.max_attempts_per_band,
         include_historical_golden=not args.no_historical_golden,
+        resume=args.resume,
+    )
+    _print_json(summary)
+
+
+def cmd_slice_dataset(args: argparse.Namespace) -> None:
+    summary = slice_dataset(
+        source_root=Path(args.source_root),
+        output_root=Path(args.output),
+        train_limit=args.train_limit,
+        dev_limit=args.dev_limit,
+        test_limit=args.test_limit,
+        adversarial_limit=args.adversarial_limit,
+        include_historical_golden=not args.no_historical_golden,
     )
     _print_json(summary)
 
@@ -143,7 +161,15 @@ def cmd_train_model(args: argparse.Namespace) -> None:
     summary = train_model(
         sft_path=Path(args.sft_jsonl),
         output_dir=Path(args.output),
-        config=TrainConfig(backend=args.backend),
+        config=TrainConfig(
+            backend=args.backend,
+            model_name=args.model_name,
+            qlora_bits=args.qlora_bits,
+            epochs=args.epochs,
+            max_seq_length=args.max_seq_length,
+            per_device_train_batch_size=args.per_device_train_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+        ),
         resume_from=Path(args.resume_from) if args.resume_from else None,
         max_examples=args.max_examples,
     )
@@ -159,6 +185,7 @@ def cmd_run_inference(args: argparse.Namespace) -> None:
         support_sft=Path(args.support_sft) if args.support_sft else None,
         few_shot_k=args.few_shot_k,
         limit=args.limit,
+        max_new_tokens=args.max_new_tokens,
         step_budget=args.step_budget,
         timeout_seconds=args.timeout_seconds,
     )
@@ -198,7 +225,34 @@ def cmd_eval_report(args: argparse.Namespace) -> None:
     _print_json(report)
 
 
-def cmd_smoke_train_eval(args: argparse.Namespace) -> None:
+def cmd_archive_failures(args: argparse.Namespace) -> None:
+    manifest = archive_failures(
+        reference_index=Path(args.reference_index),
+        prediction_index=Path(args.prediction_index),
+        output_dir=Path(args.output),
+        limit=args.limit,
+    )
+    _print_json(manifest)
+
+
+def cmd_compare_reports(args: argparse.Namespace) -> None:
+    payload = {
+        "zero_shot": json.loads(Path(args.zero_shot).read_text(encoding="utf-8")),
+        "few_shot": json.loads(Path(args.few_shot).read_text(encoding="utf-8")),
+        "fine_tuned": json.loads(Path(args.fine_tuned).read_text(encoding="utf-8")),
+    }
+    _print_json(compare_mode_reports(payload))
+
+
+def cmd_write_research_report(args: argparse.Namespace) -> None:
+    output = write_research_report(
+        summary_path=Path(args.summary),
+        output_path=Path(args.output),
+    )
+    _print_json({"output": str(output)})
+
+
+def cmd_train_eval(args: argparse.Namespace) -> None:
     dataset_root = Path(args.dataset_root)
     output_root = Path(args.output)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -211,7 +265,15 @@ def cmd_smoke_train_eval(args: argparse.Namespace) -> None:
     train_summary = train_model(
         sft_path=sft_path,
         output_dir=output_root / "model",
-        config=TrainConfig(backend="smoke"),
+        config=TrainConfig(
+            backend=args.backend,
+            model_name=args.model_name,
+            qlora_bits=args.qlora_bits,
+            epochs=args.epochs,
+            max_seq_length=args.max_seq_length,
+            per_device_train_batch_size=args.per_device_train_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+        ),
         max_examples=args.max_examples,
     )
 
@@ -220,6 +282,7 @@ def cmd_smoke_train_eval(args: argparse.Namespace) -> None:
         "train": train_summary,
         "evaluations": {},
     }
+    reports: dict[str, dict[str, object]] = {}
     for mode in ["zero_shot", "few_shot", "fine_tuned"]:
         inference_summary = run_inference(
             reference_index=eval_index,
@@ -229,6 +292,7 @@ def cmd_smoke_train_eval(args: argparse.Namespace) -> None:
             support_sft=sft_path if mode == "few_shot" else None,
             few_shot_k=args.few_shot_k,
             limit=args.limit,
+            max_new_tokens=args.max_new_tokens,
             step_budget=args.step_budget,
             timeout_seconds=args.timeout_seconds,
         )
@@ -239,15 +303,88 @@ def cmd_smoke_train_eval(args: argparse.Namespace) -> None:
         report_path = output_root / "reports" / f"{mode}.json"
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        reports[mode] = report
+        failure_manifest = archive_failures(
+            reference_index=eval_index,
+            prediction_index=Path(inference_summary["prediction_index"]),
+            output_dir=output_root / "failures" / mode,
+            limit=args.failure_archive_limit,
+        )
         results["evaluations"][mode] = {
             "prediction_index": inference_summary["prediction_index"],
             "report_path": str(report_path),
             "report": report,
+            "failure_archive": failure_manifest,
         }
+    results["baseline_delta"] = compare_mode_reports(reports)
 
     summary_path = output_root / "summary.json"
     summary_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
     _print_json(results)
+
+
+def cmd_overfit_sanity(args: argparse.Namespace) -> None:
+    dataset_index = Path(args.dataset_index)
+    output_root = Path(args.output)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    sft_path = output_root / "sft" / "train.jsonl"
+    records_written = prepare_sft_examples(
+        dataset_index=dataset_index,
+        output_path=sft_path,
+        limit=args.example_count,
+    )
+    train_summary = train_model(
+        sft_path=sft_path,
+        output_dir=output_root / "model",
+        config=TrainConfig(
+            backend=args.backend,
+            model_name=args.model_name,
+            qlora_bits=args.qlora_bits,
+            epochs=args.epochs,
+            max_seq_length=args.max_seq_length,
+            per_device_train_batch_size=args.per_device_train_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+        ),
+        max_examples=args.example_count,
+    )
+    inference_summary = run_inference(
+        reference_index=dataset_index,
+        output_dir=output_root / "predictions" / "fine_tuned",
+        mode="fine_tuned",
+        model_dir=output_root / "model",
+        limit=args.example_count,
+        max_new_tokens=args.max_new_tokens,
+        step_budget=args.step_budget,
+        timeout_seconds=args.timeout_seconds,
+    )
+    report = build_evaluation_report(
+        reference_index=dataset_index,
+        prediction_index=Path(inference_summary["prediction_index"]),
+    )
+    report_path = output_root / "reports" / "fine_tuned.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    failure_manifest = archive_failures(
+        reference_index=dataset_index,
+        prediction_index=Path(inference_summary["prediction_index"]),
+        output_dir=output_root / "failures" / "fine_tuned",
+        limit=args.failure_archive_limit,
+    )
+    summary = {
+        "records_written": records_written,
+        "example_count": args.example_count,
+        "train": train_summary,
+        "fine_tuned": {
+            "prediction_index": inference_summary["prediction_index"],
+            "report_path": str(report_path),
+            "report": report,
+            "failure_archive": failure_manifest,
+        },
+    }
+    summary_path = output_root / "summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    _print_json(summary)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -318,6 +455,7 @@ def build_parser() -> argparse.ArgumentParser:
     sft = subparsers.add_parser("prepare-sft")
     sft.add_argument("--dataset-index", required=True)
     sft.add_argument("--output", required=True)
+    sft.add_argument("--limit", type=int)
     sft.set_defaults(func=cmd_prepare_sft)
 
     pilot = subparsers.add_parser("build-pilot-corpus")
@@ -327,12 +465,29 @@ def build_parser() -> argparse.ArgumentParser:
     pilot.add_argument("--workers", type=int, default=4)
     pilot.add_argument("--max-attempts-per-band", type=int)
     pilot.add_argument("--no-historical-golden", action="store_true")
+    pilot.add_argument("--resume", action="store_true")
     pilot.set_defaults(func=cmd_build_pilot_corpus)
+
+    subset = subparsers.add_parser("slice-dataset")
+    subset.add_argument("--source-root", required=True)
+    subset.add_argument("--output", required=True)
+    subset.add_argument("--train-limit", type=int)
+    subset.add_argument("--dev-limit", type=int)
+    subset.add_argument("--test-limit", type=int)
+    subset.add_argument("--adversarial-limit", type=int)
+    subset.add_argument("--no-historical-golden", action="store_true")
+    subset.set_defaults(func=cmd_slice_dataset)
 
     train = subparsers.add_parser("train-model")
     train.add_argument("--sft-jsonl", required=True)
     train.add_argument("--output", required=True)
     train.add_argument("--backend", default="smoke")
+    train.add_argument("--model-name", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
+    train.add_argument("--qlora-bits", type=int, default=4)
+    train.add_argument("--epochs", type=int, default=3)
+    train.add_argument("--max-seq-length", type=int, default=4096)
+    train.add_argument("--per-device-train-batch-size", type=int, default=1)
+    train.add_argument("--gradient-accumulation-steps", type=int, default=8)
     train.add_argument("--resume-from")
     train.add_argument("--max-examples", type=int)
     train.set_defaults(func=cmd_train_model)
@@ -345,6 +500,7 @@ def build_parser() -> argparse.ArgumentParser:
     infer.add_argument("--support-sft")
     infer.add_argument("--few-shot-k", type=int, default=4)
     infer.add_argument("--limit", type=int)
+    infer.add_argument("--max-new-tokens", type=int, default=1024)
     infer.add_argument("--step-budget", default="50M")
     infer.add_argument("--timeout-seconds", type=int, default=30)
     infer.set_defaults(func=cmd_run_inference)
@@ -367,6 +523,45 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--prediction-index", required=True)
     report.set_defaults(func=cmd_eval_report)
 
+    archive = subparsers.add_parser("archive-failures")
+    archive.add_argument("--reference-index", required=True)
+    archive.add_argument("--prediction-index", required=True)
+    archive.add_argument("--output", required=True)
+    archive.add_argument("--limit", type=int)
+    archive.set_defaults(func=cmd_archive_failures)
+
+    compare = subparsers.add_parser("compare-reports")
+    compare.add_argument("--zero-shot", required=True)
+    compare.add_argument("--few-shot", required=True)
+    compare.add_argument("--fine-tuned", required=True)
+    compare.set_defaults(func=cmd_compare_reports)
+
+    report_md = subparsers.add_parser("write-research-report")
+    report_md.add_argument("--summary", required=True)
+    report_md.add_argument("--output", required=True)
+    report_md.set_defaults(func=cmd_write_research_report)
+
+    train_eval = subparsers.add_parser("train-eval")
+    train_eval.add_argument("--dataset-root", required=True)
+    train_eval.add_argument("--output", required=True)
+    train_eval.add_argument("--backend", default="smoke")
+    train_eval.add_argument("--model-name", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
+    train_eval.add_argument("--qlora-bits", type=int, default=4)
+    train_eval.add_argument("--epochs", type=int, default=3)
+    train_eval.add_argument("--max-seq-length", type=int, default=4096)
+    train_eval.add_argument("--per-device-train-batch-size", type=int, default=1)
+    train_eval.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    train_eval.add_argument("--train-split", default="synthetic_train.jsonl")
+    train_eval.add_argument("--eval-split", default="synthetic_dev.jsonl")
+    train_eval.add_argument("--few-shot-k", type=int, default=4)
+    train_eval.add_argument("--limit", type=int)
+    train_eval.add_argument("--max-examples", type=int)
+    train_eval.add_argument("--max-new-tokens", type=int, default=1024)
+    train_eval.add_argument("--failure-archive-limit", type=int, default=25)
+    train_eval.add_argument("--step-budget", default="50M")
+    train_eval.add_argument("--timeout-seconds", type=int, default=30)
+    train_eval.set_defaults(func=cmd_train_eval)
+
     smoke_train = subparsers.add_parser("smoke-train-eval")
     smoke_train.add_argument("--dataset-root", required=True)
     smoke_train.add_argument("--output", required=True)
@@ -375,9 +570,37 @@ def build_parser() -> argparse.ArgumentParser:
     smoke_train.add_argument("--few-shot-k", type=int, default=4)
     smoke_train.add_argument("--limit", type=int)
     smoke_train.add_argument("--max-examples", type=int)
+    smoke_train.add_argument("--max-new-tokens", type=int, default=1024)
+    smoke_train.add_argument("--failure-archive-limit", type=int, default=25)
     smoke_train.add_argument("--step-budget", default="50M")
     smoke_train.add_argument("--timeout-seconds", type=int, default=30)
-    smoke_train.set_defaults(func=cmd_smoke_train_eval)
+    smoke_train.set_defaults(
+        func=cmd_train_eval,
+        backend="smoke",
+        model_name="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
+        qlora_bits=4,
+        epochs=3,
+        max_seq_length=4096,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
+    )
+
+    overfit = subparsers.add_parser("overfit-sanity")
+    overfit.add_argument("--dataset-index", required=True)
+    overfit.add_argument("--output", required=True)
+    overfit.add_argument("--example-count", type=int, default=16)
+    overfit.add_argument("--backend", default="smoke")
+    overfit.add_argument("--model-name", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
+    overfit.add_argument("--qlora-bits", type=int, default=4)
+    overfit.add_argument("--epochs", type=int, default=3)
+    overfit.add_argument("--max-seq-length", type=int, default=4096)
+    overfit.add_argument("--per-device-train-batch-size", type=int, default=1)
+    overfit.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    overfit.add_argument("--max-new-tokens", type=int, default=1024)
+    overfit.add_argument("--failure-archive-limit", type=int, default=25)
+    overfit.add_argument("--step-budget", default="50M")
+    overfit.add_argument("--timeout-seconds", type=int, default=30)
+    overfit.set_defaults(func=cmd_overfit_sanity)
     return parser
 
 

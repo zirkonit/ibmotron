@@ -12,7 +12,7 @@ from typing import Any
 from ibm650_it import REPO_ROOT
 from ibm650_it.dataset.build_records import build_record
 from ibm650_it.dataset.dedupe import dedupe_by_hash
-from ibm650_it.dataset.io import relativize_record_paths, write_jsonl
+from ibm650_it.dataset.io import load_jsonl, relativize_record_paths, write_jsonl
 from ibm650_it.dataset.provenance import build_provenance
 from ibm650_it.dataset.split import split_by_alpha_hash
 from ibm650_it.generate.sample_program import generate_band_program, infer_features
@@ -170,10 +170,12 @@ def build_pilot_corpus(
     workers: int = 4,
     max_attempts_per_band: int | None = None,
     include_historical_golden: bool = True,
+    resume: bool = False,
 ) -> dict[str, Any]:
     output_root.mkdir(parents=True, exist_ok=True)
     provenance = build_provenance(repo_root)
     accepted: list[dict[str, Any]] = []
+    historical_golden: list[dict[str, Any]] = []
     seen_alpha: set[str] = set()
     accepted_counts: Counter[str] = Counter()
     attempts: Counter[str] = Counter()
@@ -181,6 +183,23 @@ def build_pilot_corpus(
     rejections: list[dict[str, Any]] = []
     next_seed = {band: 1 for band in band_counts}
     max_attempts_per_band = max_attempts_per_band or 20 * max(band_counts.values(), default=1)
+
+    if resume:
+        for record in load_jsonl(output_root / "index.jsonl"):
+            band = str(record["band"])
+            if band == "historical_golden":
+                historical_golden.append(record)
+                continue
+            accepted.append(record)
+            seen_alpha.add(str(record["hashes"]["alpha_hash"]))
+            accepted_counts[band] += 1
+            next_seed[band] = max(next_seed.get(band, 1), int(record["seed"]) + 1)
+        rejections.extend(load_jsonl(output_root / "rejections.jsonl"))
+        summary_path = output_root / "summary.json"
+        if summary_path.exists():
+            previous_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            attempts.update(previous_summary.get("attempts_by_band", {}))
+            rejection_counts.update(previous_summary.get("rejection_counts", {}))
 
     def needs_more() -> list[str]:
         return [
@@ -250,7 +269,10 @@ def build_pilot_corpus(
     accepted = deduped
     _remove_tree(output_root / "staging")
     if include_historical_golden:
-        accepted.extend(add_historical_golden_records(repo_root=repo_root, output_root=output_root))
+        if historical_golden:
+            accepted.extend(historical_golden)
+        else:
+            accepted.extend(add_historical_golden_records(repo_root=repo_root, output_root=output_root))
 
     index_path = write_jsonl(output_root / "index.jsonl", accepted)
     split_outputs = write_split_outputs(accepted, output_root)

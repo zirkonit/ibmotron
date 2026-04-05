@@ -1,8 +1,11 @@
+import argparse
+import json
 from pathlib import Path
 
 import pytest
 
 from ibm650_it import REPO_ROOT
+from ibm650_it.cli import cmd_overfit_sanity
 from ibm650_it.dataset.corpus import build_pilot_corpus
 from ibm650_it.dataset.io import load_jsonl
 from ibm650_it.eval.report import build_evaluation_report
@@ -119,6 +122,29 @@ def test_build_small_pilot_corpus(tmp_path: Path) -> None:
         assert Path(split_path).exists()
 
 
+def test_resume_pilot_corpus(tmp_path: Path) -> None:
+    initial = build_pilot_corpus(
+        repo_root=REPO_ROOT,
+        output_root=tmp_path / "pilot",
+        band_counts={"B0": 1, "B1": 1},
+        workers=2,
+        include_historical_golden=False,
+    )
+    resumed = build_pilot_corpus(
+        repo_root=REPO_ROOT,
+        output_root=tmp_path / "pilot",
+        band_counts={"B0": 2, "B1": 2},
+        workers=2,
+        include_historical_golden=False,
+        resume=True,
+    )
+    assert initial["accepted_total"] == 2
+    assert resumed["accepted_total"] == 4
+    records = load_jsonl(Path(resumed["index_path"]))
+    assert len(records) == 4
+    assert len({record["hashes"]["alpha_hash"] for record in records}) == 4
+
+
 def test_smoke_training_eval_pipeline(tmp_path: Path) -> None:
     pilot = build_pilot_corpus(
         repo_root=REPO_ROOT,
@@ -167,10 +193,52 @@ def test_smoke_training_eval_pipeline(tmp_path: Path) -> None:
     assert zero_report["count"] == 1
     assert zero_report["exact_match"] == 0.0
     assert zero_report["assemblability"] == 0.0
-    assert zero_report["failure_taxonomy"]["unassemblable_output"] == 1
+    assert zero_report["failure_taxonomy"]["malformed_pit_card"] == 1
+    assert "by_statement_count" in zero_report
+    assert "by_feature" in zero_report
+    assert "by_indexed_usage" in zero_report
 
     assert few_report["count"] == 1
     assert fine_report["count"] == 1
     assert fine_report["exact_match"] == 1.0
     assert fine_report["assemblability"] == 1.0
     assert fine_report["functional_equivalence"] == 1.0
+
+
+def test_smoke_overfit_sanity_pipeline(tmp_path: Path) -> None:
+    pilot = build_pilot_corpus(
+        repo_root=REPO_ROOT,
+        output_root=tmp_path / "pilot",
+        band_counts={"B0": 2, "B1": 2},
+        workers=2,
+        include_historical_golden=False,
+    )
+    index_path = Path(pilot["index_path"])
+    output_root = tmp_path / "overfit"
+
+    cmd_overfit_sanity(
+        argparse.Namespace(
+            dataset_index=str(index_path),
+            output=str(output_root),
+            example_count=2,
+            backend="smoke",
+            model_name="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
+            qlora_bits=4,
+            epochs=3,
+            max_seq_length=4096,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=8,
+            max_new_tokens=1024,
+            failure_archive_limit=10,
+            step_budget="50M",
+            timeout_seconds=30,
+        )
+    )
+
+    summary = json.loads((output_root / "summary.json").read_text(encoding="utf-8"))
+    report = summary["fine_tuned"]["report"]
+    assert summary["records_written"] == 2
+    assert report["count"] == 2
+    assert report["exact_match"] == 1.0
+    assert report["assemblability"] == 1.0
+    assert report["functional_equivalence"] == 1.0

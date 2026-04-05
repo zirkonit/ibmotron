@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from ibm650_it.training.hf_qlora import train_hf_qlora
 from ibm650_it.training.smoke_model import train_smoke_model
 
 
@@ -20,6 +21,9 @@ class TrainConfig:
     warmup_ratio: float = 0.03
     epochs: int = 3
     max_seq_length: int = 4096
+    per_device_train_batch_size: int = 1
+    gradient_accumulation_steps: int = 8
+    weight_decay: float = 0.0
 
 
 def write_train_config(output_path: Path, config: TrainConfig | None = None) -> Path:
@@ -39,6 +43,17 @@ def train_model(
 ) -> dict[str, Any]:
     resolved = config or TrainConfig()
     write_train_config(output_dir / "train_config.json", resolved)
+    if resolved.backend == "transformers_qlora":
+        summary = train_hf_qlora(
+            sft_path=sft_path,
+            output_dir=output_dir,
+            config=resolved,
+            resume_from=resume_from,
+            max_examples=max_examples,
+        )
+        summary["config_path"] = str(output_dir / "train_config.json")
+        (output_dir / "train_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        return summary
     if resolved.backend != "smoke":
         raise NotImplementedError(f"training backend is not implemented yet: {resolved.backend}")
     summary = train_smoke_model(

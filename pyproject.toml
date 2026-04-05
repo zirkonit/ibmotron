@@ -14,6 +14,14 @@ dependencies = []
 dev = [
   "pytest>=8.3.0",
 ]
+train = [
+  "accelerate>=1.10.0",
+  "bitsandbytes>=0.47.0",
+  "datasets>=4.0.0",
+  "peft>=0.17.0",
+  "torch>=2.8.0,<2.9.0",
+  "transformers>=4.56.0",
+]
 
 [project.scripts]
 ibm650-it = "ibm650_it.cli:main"
