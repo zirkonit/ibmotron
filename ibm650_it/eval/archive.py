@@ -69,6 +69,9 @@ def archive_failures(
             "functional": prediction.get("functional", False),
             "candidate_missing": candidate_missing,
             "retrieval": prediction.get("retrieval", {}),
+            "assemble": assemble,
+            "run": run,
+            "evaluator_invariant": prediction.get("evaluator_invariant"),
         }
         (case_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
         archived += 1

@@ -12,9 +12,8 @@ from ibm650_it import REPO_ROOT
 from ibm650_it.dataset.io import load_jsonl, relativize_record_paths, resolve_record_base, resolve_record_path, write_jsonl
 from ibm650_it.eval.exact_match import compare_pit_files
 from ibm650_it.eval.failure_taxonomy import classify_failure
-from ibm650_it.eval.functional import compare_run_outputs
-from ibm650_it.simh.deckio import split_tail_cards, write_deck_cards
-from ibm650_it.simh.runner import SimhRunner
+from ibm650_it.eval.reevaluate import reevaluate_prediction_records
+from ibm650_it.simh.deckio import write_deck_cards
 from ibm650_it.training.prompt_templates import build_few_shot_prompt, build_prompt, wrap_pit_completion
 from ibm650_it.training.smoke_model import (
     load_sft_examples,
@@ -225,23 +224,6 @@ def _generate_with_hf_model(
     return session.tokenizer.decode(new_tokens, skip_special_tokens=True)
 
 
-def _should_attempt_assembly(candidate_cards: list[str], *, exact_match: bool) -> bool:
-    if exact_match:
-        return True
-    precheck = classify_failure(
-        candidate_cards=candidate_cards,
-        exact_match=False,
-        assemblable=False,
-        functional=False,
-        assemble_status=None,
-    )
-    return precheck not in {
-        "malformed_source_echo_in_output",
-        "returned_it_source_instead_of_pit",
-        "malformed_pit_card",
-    }
-
-
 def _predict_completion(
     *,
     mode: str,
@@ -326,9 +308,9 @@ def run_inference(
     max_new_tokens: int = 1024,
     step_budget: str = "50M",
     timeout_seconds: int = 30,
+    eval_mode: str = "inline",
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    runner = SimhRunner(repo_root=repo_root)
     reference_records = load_jsonl(reference_index)
     if limit is not None:
         reference_records = reference_records[:limit]
@@ -375,68 +357,12 @@ def run_inference(
             reference_pit = resolve_record_path(str(reference["reference"]["translate"]["pit_raw_canonical"]), reference_base)
             exact_metrics = compare_pit_files(reference_pit, candidate_path)
 
-            assemble_status = "assemble_error"
-            run_status = "not_run"
-            assemblable = False
-            functional = False
-            assemble_paths: dict[str, str | None] = {}
-            run_paths: dict[str, str | None] = {}
-            validation_started = time.perf_counter()
-
-            if _should_attempt_assembly(candidate_cards, exact_match=bool(exact_metrics["exact_match"])):
-                try:
-                    translation_body, reservation_cards = split_tail_cards(
-                        candidate_path,
-                        10,
-                        prediction_dir / "translation_body.dck",
-                        prediction_dir / "reservation_cards.dck",
-                    )
-                    pit_phase2 = runner.build_pit_phase2_input_p1(
-                        reservation_cards,
-                        translation_body,
-                        prediction_dir / "assemble" / "pit_phase2_input_p1.dck",
-                    )
-                    assemble = runner.assemble_pit(pit_phase2, prediction_dir / "assemble", timeout_seconds=timeout_seconds)
-                    assemble_status = assemble.status
-                    assemblable = assemble.status == "ok" and assemble.soap_output is not None
-                    assemble_paths = {
-                        "pit_phase2_input_p1": str(assemble.pit_phase2_input_p1),
-                        "soap_output": str(assemble.soap_output) if assemble.soap_output is not None else None,
-                        "console_log": str(assemble.console_log),
-                        "stdout_log": str(assemble.stdout_log),
-                        "print_log": str(assemble.print_log),
-                    }
-                    if assemblable and assemble.soap_output is not None:
-                        spit = runner.build_spit_p1(assemble.soap_output, prediction_dir / "run" / "spit_p1.dck")
-                        input_deck_ref = reference["reference"]["run"].get("input_deck")
-                        input_deck = resolve_record_path(str(input_deck_ref), reference_base) if input_deck_ref else None
-                        run = runner.run_spit(
-                            spit.spit_p1,
-                            prediction_dir / "run",
-                            input_deck=input_deck,
-                            step_budget=step_budget,
-                            timeout_seconds=timeout_seconds,
-                        )
-                        run_status = run.status
-                        reference_output = resolve_record_path(str(reference["reference"]["run"]["output_deck"]), reference_base)
-                        functional = run.status == "ok" and run.output_deck is not None and compare_run_outputs(reference_output, run.output_deck)
-                        run_paths = {
-                            "spit_p1": str(run.spit_p1),
-                            "output_deck": str(run.output_deck) if run.output_deck is not None else None,
-                            "console_log": str(run.console_log),
-                            "stdout_log": str(run.stdout_log),
-                            "print_log": str(run.print_log),
-                        }
-                except Exception as exc:
-                    assemble_paths = {"error": type(exc).__name__}
-            validation_seconds = time.perf_counter() - validation_started
-
             failure_type = classify_failure(
                 candidate_cards=candidate_cards,
                 exact_match=bool(exact_metrics["exact_match"]),
-                assemblable=assemblable,
-                functional=functional,
-                assemble_status=assemble_status,
+                assemblable=False,
+                functional=False,
+                assemble_status="not_evaluated" if eval_mode == "skip" else None,
             )
             prediction_record = {
                 "id": reference["id"],
@@ -447,19 +373,17 @@ def run_inference(
                 "retrieval": metadata,
                 "metrics": exact_metrics,
                 "assemble": {
-                    "status": assemble_status,
-                    **assemble_paths,
+                    "status": "not_evaluated",
                 },
                 "run": {
-                    "status": run_status,
-                    **run_paths,
+                    "status": "not_run",
                 },
-                "assemblable": assemblable,
-                "functional": functional,
+                "assemblable": False,
+                "functional": False,
                 "failure_type": failure_type,
                 "timings": {
                     "generation_seconds": generation_seconds,
-                    "validation_seconds": validation_seconds,
+                    "evaluation_seconds": 0.0,
                     "total_seconds": time.perf_counter() - example_started,
                 },
             }
@@ -470,10 +394,21 @@ def run_inference(
         _close_hf_generation_session(hf_session)
 
     prediction_index = write_jsonl(prediction_index, prediction_records)
+    if eval_mode == "inline":
+        reevaluate_summary = reevaluate_prediction_records(
+            reference_index=reference_index,
+            prediction_index=prediction_index,
+            output_dir=output_dir,
+            repo_root=repo_root,
+            step_budget=step_budget,
+            timeout_seconds=timeout_seconds,
+        )
+        prediction_index = Path(reevaluate_summary["prediction_index"])
     summary = {
         "mode": mode,
         "count": len(prediction_records),
         "prediction_index": str(prediction_index),
+        "eval_mode": eval_mode,
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary

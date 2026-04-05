@@ -18,6 +18,23 @@ def _looks_like_it_source(candidate_cards: list[str]) -> bool:
     return it_like >= max(2, len(candidate_cards) // 2)
 
 
+def should_attempt_assembly(candidate_cards: list[str], *, exact_match: bool) -> bool:
+    if exact_match:
+        return True
+    precheck = classify_failure(
+        candidate_cards=candidate_cards,
+        exact_match=False,
+        assemblable=False,
+        functional=False,
+        assemble_status=None,
+    )
+    return precheck not in {
+        "malformed_source_echo_in_output",
+        "returned_it_source_instead_of_pit",
+        "malformed_pit_card",
+    }
+
+
 def classify_failure(
     *,
     candidate_cards: list[str],
@@ -25,7 +42,10 @@ def classify_failure(
     assemblable: bool,
     functional: bool,
     assemble_status: str | None = None,
+    evaluator_invariant: str | None = None,
 ) -> str:
+    if evaluator_invariant:
+        return "evaluator_invariant_failure"
     if exact_match:
         return "exact_match"
     joined = "\n".join(candidate_cards)

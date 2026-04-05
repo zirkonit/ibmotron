@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -11,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ibm650_it import REPO_ROOT
 from ibm650_it.cloud import RunpodCtl
+from ibm650_it.eval.finalize import finalize_overfit_output, finalize_train_eval_output
 
 
 ACCELERATE_VERSION = "1.10.0"
@@ -117,7 +119,6 @@ def remote_train_command(args: argparse.Namespace, remote_output: str) -> str:
                 ),
                 f"pip install {MAMBA_WHEEL_URL}",
                 f"pip install {CAUSAL_CONV1D_WHEEL_URL}",
-                "./scripts/build_simh.sh",
                 (
                     "python -m ibm650_it.cli overfit-sanity "
                     f"--dataset-index {dataset_index} "
@@ -126,11 +127,13 @@ def remote_train_command(args: argparse.Namespace, remote_output: str) -> str:
                     f"--backend {args.backend} "
                     f"--model-name {args.model_name} "
                     f"--qlora-bits {args.qlora_bits} "
+                    f"--learning-rate {args.learning_rate} "
                     f"--epochs {args.epochs} "
                     f"--max-seq-length {args.max_seq_length} "
                     f"--per-device-train-batch-size {args.per_device_train_batch_size} "
                     f"--gradient-accumulation-steps {args.gradient_accumulation_steps} "
                     f"--max-new-tokens {args.max_new_tokens} "
+                    "--eval-mode skip "
                     f"--failure-archive-limit {args.failure_archive_limit} "
                     f"--timeout-seconds {args.timeout_seconds}"
                 ).strip(),
@@ -161,7 +164,6 @@ def remote_train_command(args: argparse.Namespace, remote_output: str) -> str:
             ),
             f"pip install {MAMBA_WHEEL_URL}",
             f"pip install {CAUSAL_CONV1D_WHEEL_URL}",
-            "./scripts/build_simh.sh",
             (
                 "python -m ibm650_it.cli train-eval "
                 f"--dataset-root artifacts/datasets/{args.dataset_name} "
@@ -169,6 +171,7 @@ def remote_train_command(args: argparse.Namespace, remote_output: str) -> str:
                 f"--backend {args.backend} "
                 f"--model-name {args.model_name} "
                 f"--qlora-bits {args.qlora_bits} "
+                f"--learning-rate {args.learning_rate} "
                 f"--epochs {args.epochs} "
                 f"--max-seq-length {args.max_seq_length} "
                 f"--per-device-train-batch-size {args.per_device_train_batch_size} "
@@ -177,6 +180,7 @@ def remote_train_command(args: argparse.Namespace, remote_output: str) -> str:
                 + (f"--limit {args.limit} " if args.limit is not None else "")
                 + (f"--max-examples {args.max_examples} " if args.max_examples is not None else "")
                 + f"--max-new-tokens {args.max_new_tokens} "
+                + "--eval-mode skip "
                 + f"--failure-archive-limit {args.failure_archive_limit} "
                 f"--timeout-seconds {args.timeout_seconds}"
             ).strip(),
@@ -197,15 +201,18 @@ def main() -> None:
     parser.add_argument("--backend", default="transformers_qlora")
     parser.add_argument("--model-name", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
     parser.add_argument("--qlora-bits", type=int, default=4)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-seq-length", type=int, default=4096)
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--few-shot-k", type=int, default=4)
+    parser.add_argument("--eval-split", default="synthetic_dev.jsonl")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--max-examples", type=int, default=128)
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--failure-archive-limit", type=int, default=25)
+    parser.add_argument("--step-budget", default="50M")
     parser.add_argument("--timeout-seconds", type=int, default=30)
     parser.add_argument("--remote-output", default="artifacts/eval_reports/runpod_train_eval")
     parser.add_argument("--local-output", default="artifacts/eval_reports/runpod_train_eval")
@@ -253,12 +260,33 @@ def main() -> None:
             print(json.dumps(summary, indent=2))
             raise SystemExit(proc.returncode or 1)
         ctl.scp_from(ssh_info, remote_output_path, REPO_ROOT / args.local_output)
+        subprocess.run(["./scripts/build_simh.sh"], cwd=REPO_ROOT, check=True)
+        local_output_root = REPO_ROOT / args.local_output
+        if args.run_mode == "overfit-sanity":
+            finalize_overfit_output(
+                dataset_index=REPO_ROOT / args.dataset_index,
+                output_root=local_output_root,
+                failure_archive_limit=args.failure_archive_limit,
+                repo_root=REPO_ROOT,
+                step_budget=args.step_budget,
+                timeout_seconds=args.timeout_seconds,
+            )
+        else:
+            finalize_train_eval_output(
+                dataset_root=REPO_ROOT / f"artifacts/datasets/{args.dataset_name}",
+                output_root=local_output_root,
+                eval_split=args.eval_split,
+                failure_archive_limit=args.failure_archive_limit,
+                repo_root=REPO_ROOT,
+                step_budget=args.step_budget,
+                timeout_seconds=args.timeout_seconds,
+            )
         summary = {
             "pod_id": pod_id,
             "pod": pod,
             "ssh": ssh_info,
             "returncode": proc.returncode,
-            "local_output": str(REPO_ROOT / args.local_output),
+            "local_output": str(local_output_root),
         }
         print(json.dumps(summary, indent=2))
         if proc.returncode != 0:

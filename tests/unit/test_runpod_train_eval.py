@@ -15,20 +15,25 @@ def test_remote_train_command_uses_no_same_owner() -> None:
         backend="transformers_qlora",
         model_name="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
         qlora_bits=0,
+        learning_rate=1e-4,
         epochs=1,
         max_seq_length=4096,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=8,
         few_shot_k=4,
+        eval_split="synthetic_dev.jsonl",
         limit=20,
         max_examples=128,
         max_new_tokens=1024,
         failure_archive_limit=25,
+        step_budget="50M",
         timeout_seconds=30,
         example_count=32,
     )
     command = runpod_train_eval.remote_train_command(args, "artifacts/eval_reports/out")
     assert "tar --no-same-owner --no-same-permissions -xzf /workspace/ibmotron.tgz -C /workspace" in command
+    assert "./scripts/build_simh.sh" not in command
+    assert "--eval-mode skip" in command
 
 
 def test_remote_overfit_command_uses_overfit_sanity() -> None:
@@ -39,15 +44,18 @@ def test_remote_overfit_command_uses_overfit_sanity() -> None:
         backend="transformers_qlora",
         model_name="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
         qlora_bits=0,
+        learning_rate=1e-4,
         epochs=1,
         max_seq_length=4096,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=8,
         few_shot_k=4,
+        eval_split="synthetic_dev.jsonl",
         limit=20,
         max_examples=128,
         max_new_tokens=1024,
         failure_archive_limit=25,
+        step_budget="50M",
         timeout_seconds=30,
         example_count=32,
     )
@@ -55,6 +63,7 @@ def test_remote_overfit_command_uses_overfit_sanity() -> None:
     assert "python -m ibm650_it.cli overfit-sanity" in command
     assert "--dataset-index artifacts/datasets/pilot_remote_128_20/splits/synthetic_train.jsonl" in command
     assert "--example-count 32" in command
+    assert "--eval-mode skip" in command
 
 
 def test_normalize_tarinfo_clears_ownership_metadata() -> None:

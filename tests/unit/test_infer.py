@@ -1,9 +1,9 @@
+from ibm650_it.eval.failure_taxonomy import should_attempt_assembly
 from ibm650_it.training.infer import (
     HfGenerationSession,
     StopOnTokenSequence,
     _generate_with_hf_model,
     _hf_inference_runtime,
-    _should_attempt_assembly,
 )
 
 
@@ -147,7 +147,7 @@ def test_stop_on_token_sequence_accepts_multiple_variants() -> None:
 
 
 def test_should_attempt_assembly_skips_obvious_it_echo() -> None:
-    assert _should_attempt_assembly(
+    assert should_attempt_assembly(
         [
             "0001+ y1 z 1j f",
             "0002+ c1 z y1 s 7j f",
@@ -160,7 +160,7 @@ def test_should_attempt_assembly_skips_obvious_it_echo() -> None:
 
 
 def test_should_attempt_assembly_keeps_symbolic_like_outputs() -> None:
-    assert _should_attempt_assembly(
+    assert should_attempt_assembly(
         [
             "s0001 00 0000 laaaa 0000 0000",
             "s0002 69 1995 xbbbb 0000 0000",

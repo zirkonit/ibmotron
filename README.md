@@ -35,11 +35,14 @@ ibm650-it build-pilot-corpus --output artifacts/datasets/pilot_1000 --total-coun
 ibm650-it prepare-sft --dataset-index artifacts/datasets/pilot_1000/splits/synthetic_train.jsonl --output artifacts/datasets/pilot_1000/sft/train.jsonl --limit 128
 ibm650-it train-model --sft-jsonl artifacts/datasets/pilot_1000/sft/train.jsonl --output artifacts/models/m4_smoke
 ibm650-it run-inference --reference-index artifacts/datasets/pilot_1000/splits/synthetic_dev.jsonl --mode fine_tuned --model artifacts/models/m4_smoke --output artifacts/eval_reports/m4_fine
+ibm650-it reevaluate-predictions --reference-index artifacts/datasets/pilot_1000/splits/synthetic_dev.jsonl --prediction-index artifacts/eval_reports/m4_fine/predictions.jsonl --output artifacts/eval_reports/m4_fine
 ibm650-it eval-report --reference-index artifacts/datasets/pilot_1000/splits/synthetic_dev.jsonl --prediction-index artifacts/eval_reports/m4_fine/predictions.jsonl
 ibm650-it train-eval --dataset-root artifacts/datasets/pilot_1000 --output artifacts/eval_reports/full_smoke --backend smoke --limit 5
 ibm650-it smoke-train-eval --dataset-root artifacts/datasets/pilot_1000 --output artifacts/eval_reports/m4_smoke --limit 5
 ibm650-it overfit-sanity --dataset-index artifacts/datasets/pilot_1000/splits/synthetic_train.jsonl --output artifacts/eval_reports/overfit_smoke --example-count 16 --backend smoke
 python3 scripts/runpod_train_eval.py --dataset-name pilot_remote_quick --backend transformers_qlora --max-examples 4 --limit 1
+python3 scripts/runpod_sweep.py --dataset-name pilot_remote_128_20 --gpu-id "NVIDIA A40" --cloud-type SECURE
+ibm650-it dashboard --host 127.0.0.1 --port 8765 --refresh-seconds 10
 ibm650-it smoke-examples --output artifacts/smoke_examples
 ```
 
@@ -93,6 +96,47 @@ Assistant:
 ```
 
 The inference path strips the wrapper before assemblability and functional checks, and generation stops on `</PIT>` when the tokenizer exposes that token sequence.
+
+## Local Reevaluation
+
+GPU jobs now generate PIT candidates remotely and defer SOAP/SIMH validation to the local CPU environment. The `reevaluate-predictions` command recomputes assembly and functional metrics from a saved `predictions.jsonl`, rewrites prediction records with full diagnostics, regenerates the report, and refreshes the failure archive.
+
+## Dashboard
+
+Use the local dashboard to monitor active Runpod wrappers, active pods, and recent finished runs from a browser:
+
+```bash
+ibm650-it dashboard --host 127.0.0.1 --port 8765 --refresh-seconds 10
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8765
+```
+
+The page shows:
+
+- active local launcher processes
+- active or orphan Runpod pods
+- remote generation progress for `zero_shot`, `few_shot`, and `fine_tuned`
+- GPU utilization reported by `nvidia-smi`
+- recent local run summaries and top-line metrics
+
+## Runpod Sweep
+
+Use the sweep runner to execute the planned same-slice `128/20` grid over epochs and learning rates:
+
+```bash
+python3 scripts/runpod_sweep.py \
+  --dataset-name pilot_remote_128_20 \
+  --gpu-id "NVIDIA A40" \
+  --cloud-type SECURE \
+  --epochs 3 5 \
+  --learning-rates 1e-4 5e-5
+```
+
+The script writes a sweep manifest at `artifacts/eval_reports/sweeps/<name>/manifest.json` and each run keeps its own full local output directory under that sweep root.
 
 ## Overfit Sanity Check
 

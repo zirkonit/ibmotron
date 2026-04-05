@@ -7,7 +7,8 @@ import pytest
 from ibm650_it import REPO_ROOT
 from ibm650_it.cli import cmd_overfit_sanity
 from ibm650_it.dataset.corpus import build_pilot_corpus
-from ibm650_it.dataset.io import load_jsonl
+from ibm650_it.dataset.io import load_jsonl, resolve_record_path
+from ibm650_it.eval.reevaluate import reevaluate_prediction_records
 from ibm650_it.eval.report import build_evaluation_report
 from ibm650_it.generate.sample_program import generate_accepted_programs
 from ibm650_it.simh.deckio import join_decks, read_deck_cards
@@ -224,11 +225,13 @@ def test_smoke_overfit_sanity_pipeline(tmp_path: Path) -> None:
             backend="smoke",
             model_name="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
             qlora_bits=4,
+            learning_rate=1e-4,
             epochs=3,
             max_seq_length=4096,
             per_device_train_batch_size=1,
             gradient_accumulation_steps=8,
             max_new_tokens=1024,
+            eval_mode="inline",
             failure_archive_limit=10,
             step_budget="50M",
             timeout_seconds=30,
@@ -242,3 +245,85 @@ def test_smoke_overfit_sanity_pipeline(tmp_path: Path) -> None:
     assert report["exact_match"] == 1.0
     assert report["assemblability"] == 1.0
     assert report["functional_equivalence"] == 1.0
+
+
+def test_local_reevaluation_of_exact_match_prediction_produces_successful_assembly(tmp_path: Path) -> None:
+    pilot = build_pilot_corpus(
+        repo_root=REPO_ROOT,
+        output_root=tmp_path / "pilot",
+        band_counts={"B0": 2, "B1": 2},
+        workers=2,
+        include_historical_golden=False,
+    )
+    index_path = Path(pilot["index_path"])
+    sft_path = tmp_path / "training" / "train.jsonl"
+    prepare_sft_examples(dataset_index=index_path, output_path=sft_path)
+    train_model(
+        sft_path=sft_path,
+        output_dir=tmp_path / "training" / "model",
+        config=TrainConfig(backend="smoke"),
+    )
+    inference = run_inference(
+        reference_index=index_path,
+        output_dir=tmp_path / "eval" / "fine",
+        mode="fine_tuned",
+        model_dir=tmp_path / "training" / "model",
+        limit=1,
+        eval_mode="skip",
+    )
+    reevaluate = reevaluate_prediction_records(
+        reference_index=index_path,
+        prediction_index=Path(inference["prediction_index"]),
+        output_dir=tmp_path / "eval" / "fine",
+    )
+    report = build_evaluation_report(
+        reference_index=index_path,
+        prediction_index=Path(reevaluate["prediction_index"]),
+    )
+
+    assert report["count"] == 1
+    assert report["exact_match"] == 1.0
+    assert report["assemblability"] == 1.0
+    assert report["functional_equivalence"] == 1.0
+
+
+def test_local_reevaluation_flags_tail_truncation_as_misexecution(tmp_path: Path) -> None:
+    pilot = build_pilot_corpus(
+        repo_root=REPO_ROOT,
+        output_root=tmp_path / "pilot",
+        band_counts={"B0": 2, "B1": 2},
+        workers=2,
+        include_historical_golden=False,
+    )
+    index_path = Path(pilot["index_path"])
+    sft_path = tmp_path / "training" / "train.jsonl"
+    prepare_sft_examples(dataset_index=index_path, output_path=sft_path)
+    train_model(
+        sft_path=sft_path,
+        output_dir=tmp_path / "training" / "model",
+        config=TrainConfig(backend="smoke"),
+    )
+    inference = run_inference(
+        reference_index=index_path,
+        output_dir=tmp_path / "eval" / "fine",
+        mode="fine_tuned",
+        model_dir=tmp_path / "training" / "model",
+        limit=1,
+        eval_mode="skip",
+    )
+    prediction_index = Path(inference["prediction_index"])
+    record = load_jsonl(prediction_index)[0]
+    candidate_path = resolve_record_path(str(record["pit_raw_canonical"]), prediction_index.parent)
+    cards = candidate_path.read_text(encoding="latin-1").splitlines()
+    candidate_path.write_text("\n".join(cards[:-1]) + "\n", encoding="latin-1")
+
+    reevaluate = reevaluate_prediction_records(
+        reference_index=index_path,
+        prediction_index=prediction_index,
+        output_dir=tmp_path / "eval" / "fine",
+    )
+    reevaluated_record = load_jsonl(Path(reevaluate["prediction_index"]))[0]
+
+    assert reevaluated_record["metrics"]["exact_match"] is False
+    assert reevaluated_record["assemblable"] is True
+    assert reevaluated_record["failure_type"] == "assembles_but_misexecutes"

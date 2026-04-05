@@ -5,10 +5,12 @@ import json
 from pathlib import Path
 
 from ibm650_it import REPO_ROOT
+from ibm650_it.dashboard import serve_dashboard
 from ibm650_it.dataset.build_records import build_record
 from ibm650_it.dataset.corpus import build_pilot_corpus, parse_band_counts
 from ibm650_it.dataset.subset import slice_dataset
 from ibm650_it.eval.archive import archive_failures
+from ibm650_it.eval.finalize import finalize_overfit_output, finalize_train_eval_output, reevaluate_and_report_mode
 from ibm650_it.eval.report import build_evaluation_report, compare_mode_reports
 from ibm650_it.eval.research_report import write_research_report
 from ibm650_it.generate.sample_program import generate_accepted_programs, generate_band_program
@@ -165,6 +167,7 @@ def cmd_train_model(args: argparse.Namespace) -> None:
             backend=args.backend,
             model_name=args.model_name,
             qlora_bits=args.qlora_bits,
+            learning_rate=args.learning_rate,
             epochs=args.epochs,
             max_seq_length=args.max_seq_length,
             per_device_train_batch_size=args.per_device_train_batch_size,
@@ -186,6 +189,22 @@ def cmd_run_inference(args: argparse.Namespace) -> None:
         few_shot_k=args.few_shot_k,
         limit=args.limit,
         max_new_tokens=args.max_new_tokens,
+        step_budget=args.step_budget,
+        timeout_seconds=args.timeout_seconds,
+        eval_mode=args.eval_mode,
+    )
+    _print_json(summary)
+
+
+def cmd_reevaluate_predictions(args: argparse.Namespace) -> None:
+    summary = reevaluate_and_report_mode(
+        reference_index=Path(args.reference_index),
+        prediction_index=Path(args.prediction_index),
+        prediction_output_dir=Path(args.output),
+        report_path=Path(args.report_output) if args.report_output else Path(args.output) / "report.json",
+        failure_output_dir=Path(args.failure_output) if args.failure_output else Path(args.output) / "failures",
+        failure_archive_limit=args.failure_archive_limit,
+        repo_root=REPO_ROOT,
         step_budget=args.step_budget,
         timeout_seconds=args.timeout_seconds,
     )
@@ -252,6 +271,10 @@ def cmd_write_research_report(args: argparse.Namespace) -> None:
     _print_json({"output": str(output)})
 
 
+def cmd_dashboard(args: argparse.Namespace) -> None:
+    serve_dashboard(host=args.host, port=args.port, refresh_seconds=args.refresh_seconds)
+
+
 def cmd_train_eval(args: argparse.Namespace) -> None:
     dataset_root = Path(args.dataset_root)
     output_root = Path(args.output)
@@ -269,6 +292,7 @@ def cmd_train_eval(args: argparse.Namespace) -> None:
             backend=args.backend,
             model_name=args.model_name,
             qlora_bits=args.qlora_bits,
+            learning_rate=args.learning_rate,
             epochs=args.epochs,
             max_seq_length=args.max_seq_length,
             per_device_train_batch_size=args.per_device_train_batch_size,
@@ -281,8 +305,8 @@ def cmd_train_eval(args: argparse.Namespace) -> None:
         "records_written": records_written,
         "train": train_summary,
         "evaluations": {},
+        "eval_mode": args.eval_mode,
     }
-    reports: dict[str, dict[str, object]] = {}
     for mode in ["zero_shot", "few_shot", "fine_tuned"]:
         inference_summary = run_inference(
             reference_index=eval_index,
@@ -295,28 +319,24 @@ def cmd_train_eval(args: argparse.Namespace) -> None:
             max_new_tokens=args.max_new_tokens,
             step_budget=args.step_budget,
             timeout_seconds=args.timeout_seconds,
-        )
-        report = build_evaluation_report(
-            reference_index=eval_index,
-            prediction_index=Path(inference_summary["prediction_index"]),
-        )
-        report_path = output_root / "reports" / f"{mode}.json"
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-        reports[mode] = report
-        failure_manifest = archive_failures(
-            reference_index=eval_index,
-            prediction_index=Path(inference_summary["prediction_index"]),
-            output_dir=output_root / "failures" / mode,
-            limit=args.failure_archive_limit,
+            eval_mode=args.eval_mode,
         )
         results["evaluations"][mode] = {
             "prediction_index": inference_summary["prediction_index"],
-            "report_path": str(report_path),
-            "report": report,
-            "failure_archive": failure_manifest,
         }
-    results["baseline_delta"] = compare_mode_reports(reports)
+
+    if args.eval_mode == "inline":
+        results = finalize_train_eval_output(
+            dataset_root=dataset_root,
+            output_root=output_root,
+            eval_split=args.eval_split,
+            failure_archive_limit=args.failure_archive_limit,
+            repo_root=REPO_ROOT,
+            step_budget=args.step_budget,
+            timeout_seconds=args.timeout_seconds,
+        )
+        results["records_written"] = records_written
+        results["train"] = train_summary
 
     summary_path = output_root / "summary.json"
     summary_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
@@ -341,6 +361,7 @@ def cmd_overfit_sanity(args: argparse.Namespace) -> None:
             backend=args.backend,
             model_name=args.model_name,
             qlora_bits=args.qlora_bits,
+            learning_rate=args.learning_rate,
             epochs=args.epochs,
             max_seq_length=args.max_seq_length,
             per_device_train_batch_size=args.per_device_train_batch_size,
@@ -357,31 +378,28 @@ def cmd_overfit_sanity(args: argparse.Namespace) -> None:
         max_new_tokens=args.max_new_tokens,
         step_budget=args.step_budget,
         timeout_seconds=args.timeout_seconds,
-    )
-    report = build_evaluation_report(
-        reference_index=dataset_index,
-        prediction_index=Path(inference_summary["prediction_index"]),
-    )
-    report_path = output_root / "reports" / "fine_tuned.json"
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    failure_manifest = archive_failures(
-        reference_index=dataset_index,
-        prediction_index=Path(inference_summary["prediction_index"]),
-        output_dir=output_root / "failures" / "fine_tuned",
-        limit=args.failure_archive_limit,
+        eval_mode=args.eval_mode,
     )
     summary = {
         "records_written": records_written,
         "example_count": args.example_count,
         "train": train_summary,
-        "fine_tuned": {
-            "prediction_index": inference_summary["prediction_index"],
-            "report_path": str(report_path),
-            "report": report,
-            "failure_archive": failure_manifest,
-        },
+        "fine_tuned": {"prediction_index": inference_summary["prediction_index"]},
+        "eval_mode": args.eval_mode,
     }
+    if args.eval_mode == "inline":
+        summary = finalize_overfit_output(
+            dataset_index=dataset_index,
+            output_root=output_root,
+            failure_archive_limit=args.failure_archive_limit,
+            repo_root=REPO_ROOT,
+            step_budget=args.step_budget,
+            timeout_seconds=args.timeout_seconds,
+        )
+        summary["records_written"] = records_written
+        summary["example_count"] = args.example_count
+        summary["train"] = train_summary
+
     summary_path = output_root / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     _print_json(summary)
@@ -484,6 +502,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--backend", default="smoke")
     train.add_argument("--model-name", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
     train.add_argument("--qlora-bits", type=int, default=4)
+    train.add_argument("--learning-rate", type=float, default=1e-4)
     train.add_argument("--epochs", type=int, default=3)
     train.add_argument("--max-seq-length", type=int, default=4096)
     train.add_argument("--per-device-train-batch-size", type=int, default=1)
@@ -501,9 +520,21 @@ def build_parser() -> argparse.ArgumentParser:
     infer.add_argument("--few-shot-k", type=int, default=4)
     infer.add_argument("--limit", type=int)
     infer.add_argument("--max-new-tokens", type=int, default=1024)
+    infer.add_argument("--eval-mode", choices=["inline", "skip"], default="inline")
     infer.add_argument("--step-budget", default="50M")
     infer.add_argument("--timeout-seconds", type=int, default=30)
     infer.set_defaults(func=cmd_run_inference)
+
+    reevaluate = subparsers.add_parser("reevaluate-predictions")
+    reevaluate.add_argument("--reference-index", required=True)
+    reevaluate.add_argument("--prediction-index", required=True)
+    reevaluate.add_argument("--output", required=True)
+    reevaluate.add_argument("--report-output")
+    reevaluate.add_argument("--failure-output")
+    reevaluate.add_argument("--failure-archive-limit", type=int, default=25)
+    reevaluate.add_argument("--step-budget", default="50M")
+    reevaluate.add_argument("--timeout-seconds", type=int, default=30)
+    reevaluate.set_defaults(func=cmd_reevaluate_predictions)
 
     record = subparsers.add_parser("build-record")
     record.add_argument("--source", required=True)
@@ -541,12 +572,19 @@ def build_parser() -> argparse.ArgumentParser:
     report_md.add_argument("--output", required=True)
     report_md.set_defaults(func=cmd_write_research_report)
 
+    dashboard = subparsers.add_parser("dashboard")
+    dashboard.add_argument("--host", default="127.0.0.1")
+    dashboard.add_argument("--port", type=int, default=8765)
+    dashboard.add_argument("--refresh-seconds", type=int, default=10)
+    dashboard.set_defaults(func=cmd_dashboard)
+
     train_eval = subparsers.add_parser("train-eval")
     train_eval.add_argument("--dataset-root", required=True)
     train_eval.add_argument("--output", required=True)
     train_eval.add_argument("--backend", default="smoke")
     train_eval.add_argument("--model-name", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
     train_eval.add_argument("--qlora-bits", type=int, default=4)
+    train_eval.add_argument("--learning-rate", type=float, default=1e-4)
     train_eval.add_argument("--epochs", type=int, default=3)
     train_eval.add_argument("--max-seq-length", type=int, default=4096)
     train_eval.add_argument("--per-device-train-batch-size", type=int, default=1)
@@ -557,6 +595,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_eval.add_argument("--limit", type=int)
     train_eval.add_argument("--max-examples", type=int)
     train_eval.add_argument("--max-new-tokens", type=int, default=1024)
+    train_eval.add_argument("--eval-mode", choices=["inline", "skip"], default="inline")
     train_eval.add_argument("--failure-archive-limit", type=int, default=25)
     train_eval.add_argument("--step-budget", default="50M")
     train_eval.add_argument("--timeout-seconds", type=int, default=30)
@@ -571,6 +610,7 @@ def build_parser() -> argparse.ArgumentParser:
     smoke_train.add_argument("--limit", type=int)
     smoke_train.add_argument("--max-examples", type=int)
     smoke_train.add_argument("--max-new-tokens", type=int, default=1024)
+    smoke_train.add_argument("--eval-mode", choices=["inline", "skip"], default="inline")
     smoke_train.add_argument("--failure-archive-limit", type=int, default=25)
     smoke_train.add_argument("--step-budget", default="50M")
     smoke_train.add_argument("--timeout-seconds", type=int, default=30)
@@ -579,6 +619,7 @@ def build_parser() -> argparse.ArgumentParser:
         backend="smoke",
         model_name="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
         qlora_bits=4,
+        learning_rate=1e-4,
         epochs=3,
         max_seq_length=4096,
         per_device_train_batch_size=1,
@@ -592,11 +633,13 @@ def build_parser() -> argparse.ArgumentParser:
     overfit.add_argument("--backend", default="smoke")
     overfit.add_argument("--model-name", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
     overfit.add_argument("--qlora-bits", type=int, default=4)
+    overfit.add_argument("--learning-rate", type=float, default=1e-4)
     overfit.add_argument("--epochs", type=int, default=3)
     overfit.add_argument("--max-seq-length", type=int, default=4096)
     overfit.add_argument("--per-device-train-batch-size", type=int, default=1)
     overfit.add_argument("--gradient-accumulation-steps", type=int, default=8)
     overfit.add_argument("--max-new-tokens", type=int, default=1024)
+    overfit.add_argument("--eval-mode", choices=["inline", "skip"], default="inline")
     overfit.add_argument("--failure-archive-limit", type=int, default=25)
     overfit.add_argument("--step-budget", default="50M")
     overfit.add_argument("--timeout-seconds", type=int, default=30)
