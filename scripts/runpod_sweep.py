@@ -9,6 +9,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from ibm650_it.cloud import RunpodCtl
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -106,6 +110,13 @@ def _load_summary(summary_path: Path) -> dict[str, Any]:
     return json.loads(summary_path.read_text(encoding="utf-8"))
 
 
+def _load_json_output(text: str) -> dict[str, Any] | None:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sweep-name", default=f"subset_128_20_{datetime.now().astimezone().strftime('%Y%m%d_%H%M%S')}")
@@ -123,6 +134,7 @@ def main() -> None:
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--few-shot-k", type=int, default=4)
+    parser.add_argument("--train-split", default="synthetic_train.jsonl")
     parser.add_argument("--eval-split", default="synthetic_dev.jsonl")
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--max-examples", type=int, default=128)
@@ -131,6 +143,7 @@ def main() -> None:
     parser.add_argument("--step-budget", default="50M")
     parser.add_argument("--timeout-seconds", type=int, default=30)
     parser.add_argument("--output-root", default="artifacts/eval_reports/sweeps")
+    parser.add_argument("--reuse-single-pod", action="store_true")
     parser.add_argument("--keep-pod", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
@@ -149,6 +162,7 @@ def main() -> None:
         "sweep_name": args.sweep_name,
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "dataset_name": args.dataset_name,
+        "reuse_single_pod": args.reuse_single_pod,
         "grid": {
             "epochs": args.epochs,
             "learning_rates": args.learning_rates,
@@ -156,6 +170,81 @@ def main() -> None:
         "runs": [],
     }
     _write_json(manifest_path, manifest)
+
+    warm_pod_id: str | None = None
+    if args.reuse_single_pod:
+        prepare_name = f"{args.sweep_name}-warm"
+        prepare_command = [
+            sys.executable,
+            "scripts/runpod_train_eval.py",
+            "--name",
+            prepare_name,
+            "--run-mode",
+            args.run_mode,
+            "--dataset-name",
+            args.dataset_name,
+            "--backend",
+            args.backend,
+            "--model-name",
+            args.model_name,
+            "--gpu-id",
+            args.gpu_id,
+            "--cloud-type",
+            args.cloud_type,
+            "--image",
+            args.image,
+            "--qlora-bits",
+            str(args.qlora_bits),
+            "--learning-rate",
+            str(args.learning_rates[0]),
+            "--epochs",
+            str(args.epochs[0]),
+            "--max-seq-length",
+            str(args.max_seq_length),
+            "--per-device-train-batch-size",
+            str(args.per_device_train_batch_size),
+            "--gradient-accumulation-steps",
+            str(args.gradient_accumulation_steps),
+            "--few-shot-k",
+            str(args.few_shot_k),
+            "--train-split",
+            args.train_split,
+            "--eval-split",
+            args.eval_split,
+            "--limit",
+            str(args.limit),
+            "--max-examples",
+            str(args.max_examples),
+            "--max-new-tokens",
+            str(args.max_new_tokens),
+            "--failure-archive-limit",
+            str(args.failure_archive_limit),
+            "--step-budget",
+            args.step_budget,
+            "--timeout-seconds",
+            str(args.timeout_seconds),
+            "--prepare-only",
+            "--keep-pod",
+        ]
+        if args.dry_run:
+            manifest["warm_pod"] = {"status": "dry_run", "command": prepare_command}
+        else:
+            proc = _run_command(prepare_command)
+            parsed = _load_json_output(proc.stdout)
+            manifest["warm_pod"] = {
+                "status": "ok" if proc.returncode == 0 else "failed",
+                "command": prepare_command,
+                "returncode": proc.returncode,
+                "stdout_tail": proc.stdout.splitlines()[-20:],
+                "stderr_tail": proc.stderr.splitlines()[-20:],
+            }
+            if parsed is not None:
+                manifest["warm_pod"].update(parsed)
+                warm_pod_id = parsed.get("pod_id")
+            _write_json(manifest_path, manifest)
+            if proc.returncode != 0:
+                raise SystemExit(proc.returncode)
+        _write_json(manifest_path, manifest)
 
     for sweep_run in runs:
         summary_path = REPO_ROOT / sweep_run.output_path / "summary.json"
@@ -205,6 +294,8 @@ def main() -> None:
             str(args.gradient_accumulation_steps),
             "--few-shot-k",
             str(args.few_shot_k),
+            "--train-split",
+            args.train_split,
             "--eval-split",
             args.eval_split,
             "--limit",
@@ -226,6 +317,8 @@ def main() -> None:
         ]
         if args.keep_pod:
             command.append("--keep-pod")
+        if args.reuse_single_pod and warm_pod_id is not None:
+            command.extend(["--pod-id", warm_pod_id, "--reuse-pod-workspace"])
         run_record["command"] = command
         if args.dry_run:
             run_record["status"] = "dry_run"
@@ -234,9 +327,14 @@ def main() -> None:
             continue
 
         proc = _run_command(command)
+        parsed = _load_json_output(proc.stdout)
         run_record["returncode"] = proc.returncode
         run_record["stdout_tail"] = proc.stdout.splitlines()[-20:]
         run_record["stderr_tail"] = proc.stderr.splitlines()[-20:]
+        if parsed is not None:
+            run_record["summary"] = parsed
+            if parsed.get("pod_id"):
+                run_record["pod_id"] = parsed["pod_id"]
         if summary_path.exists():
             summary = _load_summary(summary_path)
             run_record["status"] = "ok" if proc.returncode == 0 else "completed_with_nonzero_returncode"
@@ -254,6 +352,9 @@ def main() -> None:
     manifest["completed_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
     manifest["passing_runs"] = passed
     manifest["total_runs"] = len(manifest["runs"])
+    if args.reuse_single_pod and warm_pod_id and not args.keep_pod and not args.dry_run:
+        ctl = RunpodCtl(repo_root=REPO_ROOT)
+        manifest["warm_pod_cleanup"] = ctl.delete_pod(warm_pod_id)
     _write_json(manifest_path, manifest)
     print(json.dumps(manifest, indent=2))
 

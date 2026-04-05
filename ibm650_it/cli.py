@@ -19,6 +19,7 @@ from ibm650_it.simh.runner import SimhRunner
 from ibm650_it.source.render_it_text import render_program
 from ibm650_it.training.infer import run_inference
 from ibm650_it.training.prepare_sft import prepare_sft_examples
+from ibm650_it.training.thinking_ablation import run_thinking_ablation
 from ibm650_it.training.train_unsloth import TrainConfig, train_model
 
 
@@ -189,6 +190,25 @@ def cmd_run_inference(args: argparse.Namespace) -> None:
         few_shot_k=args.few_shot_k,
         limit=args.limit,
         max_new_tokens=args.max_new_tokens,
+        prompt_style=args.prompt_style,
+        enable_thinking=args.enable_thinking,
+        preserve_raw_completion=args.preserve_raw_completion,
+        step_budget=args.step_budget,
+        timeout_seconds=args.timeout_seconds,
+        eval_mode=args.eval_mode,
+    )
+    _print_json(summary)
+
+
+def cmd_thinking_ablation(args: argparse.Namespace) -> None:
+    summary = run_thinking_ablation(
+        reference_index=Path(args.reference_index),
+        output_root=Path(args.output),
+        model_dir=Path(args.model),
+        repo_root=REPO_ROOT,
+        limit=args.limit,
+        max_new_tokens=args.max_new_tokens,
+        failure_archive_limit=args.failure_archive_limit,
         step_budget=args.step_budget,
         timeout_seconds=args.timeout_seconds,
         eval_mode=args.eval_mode,
@@ -520,10 +540,27 @@ def build_parser() -> argparse.ArgumentParser:
     infer.add_argument("--few-shot-k", type=int, default=4)
     infer.add_argument("--limit", type=int)
     infer.add_argument("--max-new-tokens", type=int, default=1024)
+    infer.add_argument("--prompt-style", choices=["plain", "chat"], default="plain")
+    infer.add_argument("--enable-thinking", dest="enable_thinking", action="store_true")
+    infer.add_argument("--disable-thinking", dest="enable_thinking", action="store_false")
+    infer.set_defaults(enable_thinking=None)
+    infer.add_argument("--preserve-raw-completion", action="store_true")
     infer.add_argument("--eval-mode", choices=["inline", "skip"], default="inline")
     infer.add_argument("--step-budget", default="50M")
     infer.add_argument("--timeout-seconds", type=int, default=30)
     infer.set_defaults(func=cmd_run_inference)
+
+    thinking = subparsers.add_parser("thinking-ablation")
+    thinking.add_argument("--reference-index", required=True)
+    thinking.add_argument("--model", required=True)
+    thinking.add_argument("--output", required=True)
+    thinking.add_argument("--limit", type=int)
+    thinking.add_argument("--max-new-tokens", type=int, default=1024)
+    thinking.add_argument("--eval-mode", choices=["inline", "skip"], default="inline")
+    thinking.add_argument("--failure-archive-limit", type=int, default=25)
+    thinking.add_argument("--step-budget", default="50M")
+    thinking.add_argument("--timeout-seconds", type=int, default=30)
+    thinking.set_defaults(func=cmd_thinking_ablation)
 
     reevaluate = subparsers.add_parser("reevaluate-predictions")
     reevaluate.add_argument("--reference-index", required=True)

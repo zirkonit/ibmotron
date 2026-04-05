@@ -4,6 +4,10 @@ SYSTEM_PROMPT = (
 )
 
 
+def build_it_block(it_text: str) -> str:
+    return f"<IT>\n{it_text.rstrip()}\n</IT>"
+
+
 def wrap_pit_completion(pit_text: str) -> str:
     body = pit_text.strip("\n")
     return f"<PIT>\n{body}\n</PIT>"
@@ -17,7 +21,14 @@ def ensure_pit_wrapped(pit_text: str) -> str:
 
 
 def build_prompt(it_text: str) -> str:
-    return f"{SYSTEM_PROMPT}\n\nUser:\n<IT>\n{it_text.rstrip()}\n</IT>\n\nAssistant:\n"
+    return f"{SYSTEM_PROMPT}\n\nUser:\n{build_it_block(it_text)}\n\nAssistant:\n"
+
+
+def build_chat_messages(it_text: str) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": build_it_block(it_text)},
+    ]
 
 
 def build_few_shot_prompt(
@@ -26,8 +37,20 @@ def build_few_shot_prompt(
 ) -> str:
     sections = [SYSTEM_PROMPT, ""]
     for example in examples:
-        sections.append(f"User:\n<IT>\n{example['source_text'].rstrip()}\n</IT>\n")
+        sections.append(f"User:\n{build_it_block(example['source_text'])}\n")
         sections.append(f"Assistant:\n{ensure_pit_wrapped(example['completion'])}\n")
-    sections.append(f"User:\n<IT>\n{it_text.rstrip()}\n</IT>\n")
+    sections.append(f"User:\n{build_it_block(it_text)}\n")
     sections.append("Assistant:\n")
     return "\n".join(sections)
+
+
+def build_few_shot_chat_messages(
+    it_text: str,
+    examples: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for example in examples:
+        messages.append({"role": "user", "content": build_it_block(example["source_text"])})
+        messages.append({"role": "assistant", "content": ensure_pit_wrapped(example["completion"])})
+    messages.append({"role": "user", "content": build_it_block(it_text)})
+    return messages

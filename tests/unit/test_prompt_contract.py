@@ -2,7 +2,14 @@ from pathlib import Path
 
 from ibm650_it.eval.failure_taxonomy import classify_failure
 from ibm650_it.training.prepare_sft import prepare_sft_examples
-from ibm650_it.training.prompt_templates import build_few_shot_prompt, build_prompt, ensure_pit_wrapped, wrap_pit_completion
+from ibm650_it.training.prompt_templates import (
+    build_chat_messages,
+    build_few_shot_chat_messages,
+    build_few_shot_prompt,
+    build_prompt,
+    ensure_pit_wrapped,
+    wrap_pit_completion,
+)
 
 
 def test_build_prompt_leaves_assistant_ready_for_wrapped_pit() -> None:
@@ -34,6 +41,25 @@ def test_build_few_shot_prompt_includes_single_wrapped_example_completion() -> N
 
     assert prompt.count("Assistant:\n<PIT>\ncard-1\ncard-2\n</PIT>") == 1
     assert prompt.endswith("Assistant:\n")
+
+
+def test_chat_message_builders_wrap_it_and_pit_cleanly() -> None:
+    messages = build_chat_messages("+ 0 1 0 3 1730\n0001+ y1 z 2j f\n0002+ t y1 f\n0003+ h ff\n")
+    few_shot = build_few_shot_chat_messages(
+        "+ 0 1 0 3 1730\n0001+ y1 z 2j f\n0002+ t y1 f\n0003+ h ff\n",
+        [
+            {
+                "source_text": "+ 0 1 0 3 1730\n0001+ y1 z 1j f\n0002+ t y1 f\n0003+ h ff\n",
+                "completion": "card-1\ncard-2\n",
+            }
+        ],
+    )
+
+    assert messages[0]["role"] == "system"
+    assert messages[1]["content"].startswith("<IT>\n")
+    assert messages[1]["content"].endswith("\n</IT>")
+    assert few_shot[2]["role"] == "assistant"
+    assert few_shot[2]["content"] == "<PIT>\ncard-1\ncard-2\n</PIT>"
 
 
 def test_prepare_sft_examples_wraps_targets(tmp_path: Path) -> None:

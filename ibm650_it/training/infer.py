@@ -14,7 +14,13 @@ from ibm650_it.eval.exact_match import compare_pit_files
 from ibm650_it.eval.failure_taxonomy import classify_failure
 from ibm650_it.eval.reevaluate import reevaluate_prediction_records
 from ibm650_it.simh.deckio import write_deck_cards
-from ibm650_it.training.prompt_templates import build_few_shot_prompt, build_prompt, wrap_pit_completion
+from ibm650_it.training.prompt_templates import (
+    build_chat_messages,
+    build_few_shot_chat_messages,
+    build_few_shot_prompt,
+    build_prompt,
+    wrap_pit_completion,
+)
 from ibm650_it.training.smoke_model import (
     load_sft_examples,
     load_smoke_model,
@@ -40,6 +46,15 @@ def normalize_completion_text(completion: str) -> str:
     if "</PIT>" in completion:
         completion = completion.split("</PIT>", 1)[0]
     return completion.strip("\n")
+
+
+def extract_thinking_trace(completion: str) -> str:
+    stripped = completion.strip()
+    if not stripped:
+        return ""
+    if "<PIT>" in stripped:
+        return stripped.split("<PIT>", 1)[0].rstrip()
+    return ""
 
 
 def _load_model_manifest(model_dir: Path) -> dict[str, Any]:
@@ -182,9 +197,10 @@ def _close_hf_generation_session(session: HfGenerationSession | None) -> None:
 
 def _generate_with_hf_model(
     *,
-    prompt: str,
+    prompt: str | None,
     session: HfGenerationSession,
     max_new_tokens: int = 1024,
+    prompt_input_ids: Any | None = None,
 ) -> str:
     stopping_criteria = None
     try:
@@ -192,7 +208,15 @@ def _generate_with_hf_model(
         stopping_criteria = StoppingCriteriaList([StopOnTokenSequence(session.stop_token_sequences)])
     except ImportError:
         stopping_criteria = None
-    inputs = session.tokenizer(prompt, return_tensors="pt").to(session.device)
+    if prompt_input_ids is None:
+        if prompt is None:
+            raise ValueError("either prompt or prompt_input_ids is required")
+        inputs = session.tokenizer(prompt, return_tensors="pt").to(session.device)
+    else:
+        input_ids = prompt_input_ids
+        if getattr(input_ids, "ndim", None) == 1:
+            input_ids = input_ids.unsqueeze(0)
+        inputs = {"input_ids": input_ids.to(session.device)}
     try:
         import torch
 
@@ -232,32 +256,82 @@ def _predict_completion(
     support_sft: Path | None,
     few_shot_k: int,
     max_new_tokens: int,
+    prompt_style: str = "plain",
+    enable_thinking: bool | None = None,
     hf_session: HfGenerationSession | None = None,
     support_examples: list[Any] | None = None,
-) -> tuple[str, dict[str, Any], str]:
+) -> tuple[str, str, dict[str, Any], str]:
     manifest = _load_model_manifest(model_dir) if model_dir is not None and (model_dir / "model.json").exists() else None
     if manifest is not None and manifest.get("backend") == "transformers_qlora":
-        if mode == "few_shot":
-            if support_examples is None:
-                raise ValueError("few_shot inference requires support_sft")
-            prompt_examples = [
-                {
-                    "source_text": example.source_text,
-                    "completion": example.completion,
-                }
-                for example in support_examples[:few_shot_k]
-            ]
-            prompt = build_few_shot_prompt(source_text, prompt_examples)
-        else:
-            prompt = build_prompt(source_text)
         if hf_session is None:
             raise ValueError("transformers_qlora inference requires a loaded hf_session")
-        completion = _generate_with_hf_model(
+        prompt_input_ids = None
+        if prompt_style == "chat":
+            if not hasattr(hf_session.tokenizer, "apply_chat_template"):
+                raise RuntimeError("chat prompt style requires tokenizer.apply_chat_template support")
+            if mode == "few_shot":
+                if support_examples is None:
+                    raise ValueError("few_shot inference requires support_sft")
+                prompt_examples = [
+                    {
+                        "source_text": example.source_text,
+                        "completion": example.completion,
+                    }
+                    for example in support_examples[:few_shot_k]
+                ]
+                messages = build_few_shot_chat_messages(source_text, prompt_examples)
+            else:
+                messages = build_chat_messages(source_text)
+            template_kwargs: dict[str, Any] = {"add_generation_prompt": True}
+            if enable_thinking is not None:
+                template_kwargs["enable_thinking"] = enable_thinking
+            try:
+                prompt = hf_session.tokenizer.apply_chat_template(messages, tokenize=False, **template_kwargs)
+                prompt_input_ids = hf_session.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    return_tensors="pt",
+                    **template_kwargs,
+                )
+            except TypeError:
+                template_kwargs.pop("enable_thinking", None)
+                prompt = hf_session.tokenizer.apply_chat_template(messages, tokenize=False, **template_kwargs)
+                prompt_input_ids = hf_session.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    return_tensors="pt",
+                    **template_kwargs,
+                )
+        else:
+            if mode == "few_shot":
+                if support_examples is None:
+                    raise ValueError("few_shot inference requires support_sft")
+                prompt_examples = [
+                    {
+                        "source_text": example.source_text,
+                        "completion": example.completion,
+                    }
+                    for example in support_examples[:few_shot_k]
+                ]
+                prompt = build_few_shot_prompt(source_text, prompt_examples)
+            else:
+                prompt = build_prompt(source_text)
+        raw_completion = _generate_with_hf_model(
             prompt=prompt,
             session=hf_session,
             max_new_tokens=max_new_tokens,
+            prompt_input_ids=prompt_input_ids,
         )
-        return normalize_completion_text(completion), {"backend": "transformers_qlora"}, prompt
+        return (
+            raw_completion,
+            normalize_completion_text(raw_completion),
+            {
+                "backend": "transformers_qlora",
+                "prompt_style": prompt_style,
+                "enable_thinking": enable_thinking,
+            },
+            prompt,
+        )
     if mode == "zero_shot":
         prediction = predict_zero_shot(source_text=source_text)
         prompt = build_prompt(source_text)
@@ -291,8 +365,11 @@ def _predict_completion(
         "matched_example_id": prediction.matched_example_id,
         "matched_score": prediction.matched_score,
         "support_example_ids": prediction.support_example_ids,
+        "prompt_style": prompt_style,
+        "enable_thinking": enable_thinking,
     }
-    return normalize_completion_text(prediction.completion), metadata, prompt
+    raw_completion = prediction.completion
+    return raw_completion, normalize_completion_text(raw_completion), metadata, prompt
 
 
 def run_inference(
@@ -306,6 +383,9 @@ def run_inference(
     few_shot_k: int = 4,
     limit: int | None = None,
     max_new_tokens: int = 1024,
+    prompt_style: str = "plain",
+    enable_thinking: bool | None = None,
+    preserve_raw_completion: bool = False,
     step_budget: str = "50M",
     timeout_seconds: int = 30,
     eval_mode: str = "inline",
@@ -340,18 +420,27 @@ def run_inference(
             prediction_dir.mkdir(parents=True, exist_ok=True)
             source_text = resolve_record_path(str(reference["source"]["it_text_v1"]), reference_base).read_text(encoding="utf-8")
             generation_started = time.perf_counter()
-            completion_text, metadata, prompt = _predict_completion(
+            raw_completion_text, completion_text, metadata, prompt = _predict_completion(
                 mode=mode,
                 source_text=source_text,
                 model_dir=model_dir,
                 support_sft=support_sft,
                 few_shot_k=few_shot_k,
                 max_new_tokens=max_new_tokens,
+                prompt_style=prompt_style,
+                enable_thinking=enable_thinking,
                 hf_session=hf_session,
                 support_examples=support_examples,
             )
             generation_seconds = time.perf_counter() - generation_started
             prompt_path = write_inference_request(prompt, prediction_dir / "prompt.txt")
+            raw_completion_path = None
+            thinking_trace_path = None
+            if preserve_raw_completion:
+                raw_completion_path = write_inference_request(raw_completion_text, prediction_dir / "raw_completion.txt")
+                thinking_trace = extract_thinking_trace(raw_completion_text)
+                if thinking_trace:
+                    thinking_trace_path = write_inference_request(thinking_trace, prediction_dir / "thinking_trace.txt")
             candidate_cards = completion_text.splitlines()
             candidate_path = write_deck_cards(prediction_dir / "pit_raw_canonical.dck", candidate_cards)
             reference_pit = resolve_record_path(str(reference["reference"]["translate"]["pit_raw_canonical"]), reference_base)
@@ -371,6 +460,8 @@ def run_inference(
                 "pit_raw_canonical": str(candidate_path),
                 "prompt_path": str(prompt_path),
                 "retrieval": metadata,
+                "raw_completion_path": str(raw_completion_path) if raw_completion_path is not None else None,
+                "thinking_trace_path": str(thinking_trace_path) if thinking_trace_path is not None else None,
                 "metrics": exact_metrics,
                 "assemble": {
                     "status": "not_evaluated",
@@ -409,6 +500,9 @@ def run_inference(
         "count": len(prediction_records),
         "prediction_index": str(prediction_index),
         "eval_mode": eval_mode,
+        "prompt_style": prompt_style,
+        "enable_thinking": enable_thinking,
+        "preserve_raw_completion": preserve_raw_completion,
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary

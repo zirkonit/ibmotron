@@ -47,6 +47,39 @@ def test_derive_phase_uses_remote_progress() -> None:
     assert phase == "fine_tuned"
 
 
+def test_derive_phase_handles_reused_workspace_without_tgz() -> None:
+    job = {"pid": 123, "run_mode": "train-eval", "limit": 20}
+    remote = {
+        "tgz_exists": False,
+        "repo_exists": True,
+        "output_exists": True,
+        "active_process": True,
+        "progress": {
+            "zero_shot": {"lines": 20, "expected": 20},
+            "few_shot": {"lines": 20, "expected": 20},
+            "fine_tuned": {"lines": 4, "expected": 20},
+        },
+    }
+
+    phase = dashboard._derive_phase(job, remote)
+
+    assert phase == "fine_tuned"
+
+
+def test_match_pod_prefers_explicit_pod_id() -> None:
+    job = {"name": "run-name", "pod_id_arg": "warm-pod-123"}
+    pods_by_id = {
+        "warm-pod-123": {"id": "warm-pod-123", "name": "shared-warm-pod"},
+    }
+    pods_by_name = {
+        "run-name": {"id": "cold-pod-999", "name": "run-name"},
+    }
+
+    pod = dashboard._match_pod(job, pods_by_id, pods_by_name)
+
+    assert pod == {"id": "warm-pod-123", "name": "shared-warm-pod"}
+
+
 def test_collect_recent_runs_reads_top_level_summaries(tmp_path: Path, monkeypatch) -> None:
     eval_root = tmp_path / "artifacts" / "eval_reports"
     run_dir = eval_root / "run_one"
@@ -69,3 +102,62 @@ def test_collect_recent_runs_reads_top_level_summaries(tmp_path: Path, monkeypat
     assert runs[0]["path"] == "artifacts/eval_reports/run_one"
     assert runs[0]["eval_mode"] == "local_cpu_reevaluate"
     assert runs[0]["train"]["backend"] == "transformers_qlora"
+
+
+def test_collect_dashboard_status_matches_warm_pod_by_id(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dashboard,
+        "collect_active_wrappers",
+        lambda: [
+            {
+                "pid": 123,
+                "elapsed": "00:10",
+                "command": "python scripts/runpod_train_eval.py",
+                "name": "run-three",
+                "run_mode": "train-eval",
+                "remote_output": "artifacts/eval_reports/out",
+                "local_output": "artifacts/eval_reports/out",
+                "limit": 20,
+                "example_count": None,
+                "pod_id_arg": "warm-pod-123",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "collect_pods",
+        lambda: [
+            {
+                "id": "warm-pod-123",
+                "name": "shared-warm-pod",
+                "gpu": "NVIDIA A40",
+                "cost_per_hr": 0.4,
+                "status": "RUNNING",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "_ssh_remote_status",
+        lambda *args, **kwargs: {
+            "tgz_exists": False,
+            "repo_exists": True,
+            "output_exists": True,
+            "active_process": True,
+            "progress": {
+                "zero_shot": {"lines": 20, "expected": 20},
+                "few_shot": {"lines": 20, "expected": 20},
+                "fine_tuned": {"lines": 3, "expected": 20},
+            },
+            "gpu": "96, 30113, 46068",
+        },
+    )
+    monkeypatch.setattr(dashboard, "_read_archive_size", lambda pid: None)
+
+    status = dashboard.collect_dashboard_status(dashboard.DashboardConfig())
+
+    assert len(status["active_jobs"]) == 1
+    job = status["active_jobs"][0]
+    assert job["pod_id"] == "warm-pod-123"
+    assert job["phase"] == "fine_tuned"
+    assert status["orphan_pods"] == []

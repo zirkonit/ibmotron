@@ -4,6 +4,7 @@ from ibm650_it.training.infer import (
     StopOnTokenSequence,
     _generate_with_hf_model,
     _hf_inference_runtime,
+    extract_thinking_trace,
 )
 
 
@@ -37,6 +38,14 @@ class DummyIds(list):
     def shape(self) -> tuple[int, int]:
         return (1, len(self[0]))
 
+    @property
+    def ndim(self) -> int:
+        return 2
+
+    def to(self, device: str) -> "DummyIds":
+        self.device = device
+        return self
+
 
 class DummyTokenizerForGenerate:
     pad_token_id = 1
@@ -55,7 +64,6 @@ class DummyTokenizerForGenerate:
 class DummyModel:
     def generate(self, **kwargs: object) -> list[list[int]]:
         assert kwargs["input_ids"] == [[10, 11]]
-        assert kwargs["device"] == "cuda:0"
         assert kwargs["max_new_tokens"] == 7
         assert kwargs["use_cache"] is True
         return [[10, 11, 21, 22, 23]]
@@ -96,6 +104,30 @@ def test_generate_with_hf_model_uses_session_model_and_strips_prompt_tokens() ->
     )
 
     assert completion == "21,22,23"
+
+
+def test_generate_with_hf_model_accepts_pre_tokenized_input_ids() -> None:
+    session = HfGenerationSession(
+        tokenizer=DummyTokenizerForGenerate(),
+        model=DummyModel(),
+        device="cuda:0",
+        stop_token_sequences=[],
+    )
+
+    completion = _generate_with_hf_model(
+        prompt=None,
+        prompt_input_ids=DummyIds([[10, 11]]),
+        session=session,
+        max_new_tokens=7,
+    )
+
+    assert completion == "21,22,23"
+
+
+def test_extract_thinking_trace_returns_prefix_before_pit() -> None:
+    raw_completion = "I will reason first.\nStill thinking.\n<PIT>\ncard-1\n</PIT>"
+
+    assert extract_thinking_trace(raw_completion) == "I will reason first.\nStill thinking."
 
 
 def test_stop_on_token_sequence_accepts_multiple_variants() -> None:

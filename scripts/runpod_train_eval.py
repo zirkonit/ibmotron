@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ibm650_it import REPO_ROOT
 from ibm650_it.cloud import RunpodCtl
+from ibm650_it.dataset.io import load_jsonl, resolve_record_base, resolve_record_path
 from ibm650_it.eval.finalize import finalize_overfit_output, finalize_train_eval_output
 
 
@@ -28,20 +30,14 @@ CAUSAL_CONV1D_WHEEL_URL = (
     "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/"
     "causal_conv1d-1.6.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 )
+READY_MARKER = "/workspace/ibmotron/.ibmotron_ready.json"
+ARCHIVE_CACHE_DIR = REPO_ROOT / "artifacts" / "cache" / "runpod_archives"
 
 
-INCLUDE_PATHS = [
+REMOTE_BASE_INCLUDE_PATHS = [
     "README.md",
-    "Makefile",
-    "SPEC.md",
     "pyproject.toml",
-    "sources.lock.json",
-    "docker",
-    "docs",
-    "scripts",
     "ibm650_it",
-    "tests",
-    "third_party/simh",
 ]
 
 EXCLUDE_PARTS = {
@@ -74,51 +70,160 @@ def _normalize_tarinfo(info: tarfile.TarInfo) -> tarfile.TarInfo:
     return info
 
 
-def build_archive(archive_path: Path, *, dataset_name: str) -> Path:
-    include_paths = [*INCLUDE_PATHS, f"artifacts/datasets/{dataset_name}"]
+def _iter_repo_paths(include_paths: list[str]) -> list[Path]:
+    repo_paths: list[Path] = []
+    for relative in include_paths:
+        target = REPO_ROOT / relative
+        if not target.exists():
+            continue
+        if target.is_file():
+            repo_paths.append(target)
+            continue
+        for path in target.rglob("*"):
+            if path.exists() and _include_path(path.relative_to(REPO_ROOT)):
+                repo_paths.append(path)
+    return sorted(repo_paths)
+
+
+def _archive_fingerprint(repo_paths: list[Path]) -> str:
+    payload = [
+        {
+            "path": str(path.relative_to(REPO_ROOT)),
+            "size": path.stat().st_size,
+            "mtime_ns": path.stat().st_mtime_ns,
+        }
+        for path in repo_paths
+        if path.is_file()
+    ]
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
+def _write_archive(archive_path: Path, repo_paths: list[Path]) -> Path:
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive_path, "w:gz") as tar:
-        for relative in include_paths:
-            target = REPO_ROOT / relative
-            if not target.exists():
+        for path in repo_paths:
+            if not path.is_file():
                 continue
-            if target.is_file():
-                tar.add(target, arcname=f"ibmotron/{relative}", filter=_normalize_tarinfo)
-                continue
-            for path in target.rglob("*"):
-                if not path.exists() or not _include_path(path.relative_to(REPO_ROOT)):
-                    continue
-                tar.add(path, arcname=f"ibmotron/{path.relative_to(REPO_ROOT)}", filter=_normalize_tarinfo)
+            tar.add(path, arcname=f"ibmotron/{path.relative_to(REPO_ROOT)}", filter=_normalize_tarinfo)
     return archive_path
 
 
-def remote_train_command(args: argparse.Namespace, remote_output: str) -> str:
+def build_base_archive() -> Path:
+    repo_paths = _iter_repo_paths(REMOTE_BASE_INCLUDE_PATHS)
+    fingerprint = _archive_fingerprint(repo_paths)
+    archive_path = ARCHIVE_CACHE_DIR / f"base_{fingerprint}.tgz"
+    if archive_path.exists():
+        return archive_path
+    return _write_archive(archive_path, repo_paths)
+
+
+def _dataset_root_from_args(args: argparse.Namespace) -> Path:
+    if args.run_mode == "overfit-sanity" and args.dataset_index:
+        return resolve_record_base(Path(args.dataset_index))
+    return REPO_ROOT / "artifacts" / "datasets" / args.dataset_name
+
+
+def _dataset_index_paths(args: argparse.Namespace) -> list[Path]:
+    dataset_root = _dataset_root_from_args(args)
+    if args.run_mode == "overfit-sanity":
+        if args.dataset_index is None:
+            return [dataset_root / "splits" / "synthetic_train.jsonl"]
+        return [Path(args.dataset_index)]
+    return [
+        dataset_root / "splits" / args.train_split,
+        dataset_root / "splits" / args.eval_split,
+    ]
+
+
+def _repo_relative(path: Path) -> Path:
+    return path.resolve().relative_to(REPO_ROOT)
+
+
+def _collect_remote_dataset_repo_paths(args: argparse.Namespace) -> list[Path]:
+    dataset_root = _dataset_root_from_args(args)
+    repo_paths: set[Path] = set()
+    for index_path in _dataset_index_paths(args):
+        resolved_index = index_path.resolve()
+        repo_paths.add(REPO_ROOT / _repo_relative(resolved_index))
+        base_dir = resolve_record_base(index_path)
+        for record in load_jsonl(index_path):
+            source_path = resolve_record_path(str(record["source"]["it_text_v1"]), base_dir)
+            target_path = resolve_record_path(str(record["reference"]["translate"]["pit_raw_canonical"]), base_dir)
+            repo_paths.add(REPO_ROOT / _repo_relative(source_path))
+            repo_paths.add(REPO_ROOT / _repo_relative(target_path))
+    summary_path = dataset_root / "summary.json"
+    if summary_path.exists():
+        repo_paths.add(summary_path)
+    return sorted(repo_paths)
+
+
+def build_dataset_archive(args: argparse.Namespace) -> Path:
+    repo_paths = _collect_remote_dataset_repo_paths(args)
+    dataset_root = _dataset_root_from_args(args)
+    fingerprint = _archive_fingerprint(repo_paths)
+    archive_path = ARCHIVE_CACHE_DIR / f"{dataset_root.name}_{fingerprint}.tgz"
+    if archive_path.exists():
+        return archive_path
+    return _write_archive(archive_path, repo_paths)
+
+
+def _base_runtime_steps() -> list[str]:
+    return [
+        "cd /workspace/ibmotron",
+        ". .venv/bin/activate",
+        "export HF_HOME=/workspace/.cache/huggingface",
+        "mkdir -p \"$HF_HOME\"",
+    ]
+
+
+def remote_prepare_command() -> str:
+    return " && ".join(
+        [
+            "export DEBIAN_FRONTEND=noninteractive",
+            "apt-get update",
+            "apt-get install -y build-essential git python3-pip python3-venv",
+            "mkdir -p /workspace",
+            "mkdir -p /workspace/ibmotron",
+            f"rm -f {READY_MARKER}",
+            "rm -rf /workspace/ibmotron/.venv",
+            "tar --no-same-owner --no-same-permissions -xzf /workspace/ibmotron-base.tgz -C /workspace",
+            "tar --no-same-owner --no-same-permissions -xzf /workspace/ibmotron-dataset.tgz -C /workspace",
+            "cd /workspace/ibmotron",
+            "python3 -m venv .venv --system-site-packages",
+            ". .venv/bin/activate",
+            "export HF_HOME=/workspace/.cache/huggingface",
+            "mkdir -p \"$HF_HOME\"",
+            "python -m pip install --upgrade pip",
+            "pip install -e .",
+            (
+                "pip install "
+                f"accelerate=={ACCELERATE_VERSION} "
+                f"bitsandbytes=={BITSANDBYTES_VERSION} "
+                f"datasets=={DATASETS_VERSION} "
+                f"peft=={PEFT_VERSION} "
+                f"transformers=={TRANSFORMERS_VERSION}"
+            ),
+            f"pip install {MAMBA_WHEEL_URL}",
+            f"pip install {CAUSAL_CONV1D_WHEEL_URL}",
+            (
+                "python - <<'PY'\n"
+                "import json\n"
+                "from pathlib import Path\n"
+                f"Path({READY_MARKER!r}).write_text(json.dumps({{'ready': True}}), encoding='utf-8')\n"
+                "PY"
+            ),
+        ]
+    )
+
+
+def remote_train_command(args: argparse.Namespace, remote_output: str, *, reuse_workspace: bool = False) -> str:
+    prefix = _base_runtime_steps() if reuse_workspace else [remote_prepare_command(), *_base_runtime_steps()]
     if args.run_mode == "overfit-sanity":
         dataset_index = args.dataset_index or f"artifacts/datasets/{args.dataset_name}/splits/synthetic_train.jsonl"
         return " && ".join(
             [
-                "export DEBIAN_FRONTEND=noninteractive",
-                "apt-get update",
-                "apt-get install -y build-essential git python3-pip python3-venv",
-                "mkdir -p /workspace",
-                "rm -rf /workspace/ibmotron",
-                "tar --no-same-owner --no-same-permissions -xzf /workspace/ibmotron.tgz -C /workspace",
-                "cd /workspace/ibmotron",
-                "python3 -m venv .venv --system-site-packages",
-                ". .venv/bin/activate",
-                "export HF_HOME=/workspace/.cache/huggingface",
-                "mkdir -p \"$HF_HOME\"",
-                "python -m pip install --upgrade pip",
-                "pip install -e \".[dev]\"",
-                (
-                    "pip install "
-                    f"accelerate=={ACCELERATE_VERSION} "
-                    f"bitsandbytes=={BITSANDBYTES_VERSION} "
-                    f"datasets=={DATASETS_VERSION} "
-                    f"peft=={PEFT_VERSION} "
-                    f"transformers=={TRANSFORMERS_VERSION}"
-                ),
-                f"pip install {MAMBA_WHEEL_URL}",
-                f"pip install {CAUSAL_CONV1D_WHEEL_URL}",
+                *prefix,
                 (
                     "python -m ibm650_it.cli overfit-sanity "
                     f"--dataset-index {dataset_index} "
@@ -141,29 +246,7 @@ def remote_train_command(args: argparse.Namespace, remote_output: str) -> str:
         )
     return " && ".join(
         [
-            "export DEBIAN_FRONTEND=noninteractive",
-            "apt-get update",
-            "apt-get install -y build-essential git python3-pip python3-venv",
-            "mkdir -p /workspace",
-            "rm -rf /workspace/ibmotron",
-            "tar --no-same-owner --no-same-permissions -xzf /workspace/ibmotron.tgz -C /workspace",
-            "cd /workspace/ibmotron",
-            "python3 -m venv .venv --system-site-packages",
-            ". .venv/bin/activate",
-            "export HF_HOME=/workspace/.cache/huggingface",
-            "mkdir -p \"$HF_HOME\"",
-            "python -m pip install --upgrade pip",
-            "pip install -e \".[dev]\"",
-            (
-                "pip install "
-                f"accelerate=={ACCELERATE_VERSION} "
-                f"bitsandbytes=={BITSANDBYTES_VERSION} "
-                f"datasets=={DATASETS_VERSION} "
-                f"peft=={PEFT_VERSION} "
-                f"transformers=={TRANSFORMERS_VERSION}"
-            ),
-            f"pip install {MAMBA_WHEEL_URL}",
-            f"pip install {CAUSAL_CONV1D_WHEEL_URL}",
+            *prefix,
             (
                 "python -m ibm650_it.cli train-eval "
                 f"--dataset-root artifacts/datasets/{args.dataset_name} "
@@ -207,6 +290,7 @@ def main() -> None:
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--few-shot-k", type=int, default=4)
+    parser.add_argument("--train-split", default="synthetic_train.jsonl")
     parser.add_argument("--eval-split", default="synthetic_dev.jsonl")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--max-examples", type=int, default=128)
@@ -217,8 +301,15 @@ def main() -> None:
     parser.add_argument("--remote-output", default="artifacts/eval_reports/runpod_train_eval")
     parser.add_argument("--local-output", default="artifacts/eval_reports/runpod_train_eval")
     parser.add_argument("--example-count", type=int, default=32)
+    parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--reuse-pod-workspace", action="store_true")
     parser.add_argument("--keep-pod", action="store_true")
     args = parser.parse_args()
+
+    if args.prepare_only and not (args.keep_pod or args.pod_id):
+        raise SystemExit("--prepare-only requires --keep-pod or --pod-id so the prepared pod is retained")
+    if args.reuse_pod_workspace and not args.pod_id:
+        raise SystemExit("--reuse-pod-workspace requires --pod-id")
 
     ctl = RunpodCtl(repo_root=REPO_ROOT)
     ctl.ensure_ssh_key()
@@ -235,17 +326,41 @@ def main() -> None:
         )
     )
     pod_id = pod["id"]
-    archive_path = Path(tempfile.gettempdir()) / "ibmotron-runpod.tgz"
     try:
-        build_archive(archive_path, dataset_name=args.dataset_name)
         ssh_info = ctl.wait_for_ssh(pod_id, timeout_seconds=600, poll_seconds=10)
-        ctl.scp_to(ssh_info, archive_path, "/workspace/ibmotron.tgz")
-        remote_command = remote_train_command(args, args.remote_output)
+        if args.prepare_only or not args.reuse_pod_workspace:
+            base_archive = build_base_archive()
+            dataset_archive = build_dataset_archive(args)
+            ctl.scp_to(ssh_info, base_archive, "/workspace/ibmotron-base.tgz")
+            ctl.scp_to(ssh_info, dataset_archive, "/workspace/ibmotron-dataset.tgz")
+        if args.reuse_pod_workspace:
+            ready = ctl.ssh(ssh_info, f"test -f {READY_MARKER}", check=False)
+            if ready.returncode != 0:
+                raise SystemExit(f"remote workspace on pod {pod_id} is not prepared; missing {READY_MARKER}")
+        remote_command = remote_prepare_command() if args.prepare_only else remote_train_command(
+            args,
+            args.remote_output,
+            reuse_workspace=args.reuse_pod_workspace,
+        )
         proc = ctl.ssh(ssh_info, remote_command, check=False)
         logs_dir = REPO_ROOT / "artifacts" / "logs" / "runpod"
         logs_dir.mkdir(parents=True, exist_ok=True)
-        (logs_dir / f"{pod_id}.stdout.log").write_text(proc.stdout, encoding="utf-8")
-        (logs_dir / f"{pod_id}.stderr.log").write_text(proc.stderr, encoding="utf-8")
+        log_stem = f"{pod_id}.{args.name}"
+        (logs_dir / f"{log_stem}.stdout.log").write_text(proc.stdout, encoding="utf-8")
+        (logs_dir / f"{log_stem}.stderr.log").write_text(proc.stderr, encoding="utf-8")
+        if args.prepare_only:
+            summary = {
+                "pod_id": pod_id,
+                "pod": pod,
+                "ssh": ssh_info,
+                "returncode": proc.returncode,
+                "prepared": proc.returncode == 0,
+                "ready_marker": READY_MARKER,
+            }
+            print(json.dumps(summary, indent=2))
+            if proc.returncode != 0:
+                raise SystemExit(proc.returncode)
+            return
         remote_output_path = f"/workspace/ibmotron/{args.remote_output}"
         exists = ctl.ssh(ssh_info, f"test -e {remote_output_path}", check=False)
         if exists.returncode != 0:

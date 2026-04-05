@@ -435,7 +435,7 @@ root = Path("/workspace/ibmotron")
 output = root / {json.dumps(remote_output)}
 workspace = Path("/workspace")
 data = {{
-    "tgz_exists": (workspace / "ibmotron.tgz").exists(),
+    "tgz_exists": any((workspace / name).exists() for name in ["ibmotron.tgz", "ibmotron-base.tgz", "ibmotron-dataset.tgz"]),
     "repo_exists": root.exists(),
     "output_exists": output.exists(),
     "progress": {{}},
@@ -522,13 +522,13 @@ def _derive_phase(job: dict[str, Any], remote: dict[str, Any] | None) -> str:
         return "packaging" if archive_size else "launching"
     if remote.get("error"):
         return "remote_error"
-    if not remote.get("tgz_exists"):
-        return "packaging"
-    if remote.get("tgz_exists") and not remote.get("repo_exists"):
-        return "uploading"
-    progress = remote.get("progress", {})
+    if not remote.get("repo_exists"):
+        return "packaging" if not remote.get("tgz_exists") else "uploading"
+    if remote.get("repo_exists") and not remote.get("output_exists"):
+        return "bootstrap"
     if not remote.get("active_process"):
         return "remote_complete" if remote.get("output_exists") else "bootstrap"
+    progress = remote.get("progress", {})
     if progress.get("fine_tuned", {}).get("lines") and progress["fine_tuned"]["expected"] and progress["fine_tuned"]["lines"] < progress["fine_tuned"]["expected"]:
         return "fine_tuned"
     if progress.get("few_shot", {}).get("lines") and progress["few_shot"]["expected"] and progress["few_shot"]["lines"] < progress["few_shot"]["expected"]:
@@ -538,6 +538,18 @@ def _derive_phase(job: dict[str, Any], remote: dict[str, Any] | None) -> str:
     if remote.get("output_exists"):
         return "training"
     return "bootstrap"
+
+
+def _match_pod(job: dict[str, Any], pods_by_id: dict[str, dict[str, Any]], pods_by_name: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    pod_id_arg = str(job.get("pod_id_arg") or "")
+    if pod_id_arg:
+        pod = pods_by_id.get(pod_id_arg)
+        if pod is not None:
+            return pod
+    job_name = str(job.get("name") or "")
+    if job_name:
+        return pods_by_name.get(job_name)
+    return None
 
 
 def collect_recent_runs(limit: int = 8) -> list[dict[str, Any]]:
@@ -567,11 +579,12 @@ def collect_recent_runs(limit: int = 8) -> list[dict[str, Any]]:
 def collect_dashboard_status(config: DashboardConfig) -> dict[str, Any]:
     wrappers = collect_active_wrappers()
     pods = collect_pods()
+    pods_by_id = {pod["id"]: pod for pod in pods if pod["id"]}
     pods_by_name = {pod["name"]: pod for pod in pods if pod["name"]}
     matched_pod_ids: set[str] = set()
     active_jobs: list[dict[str, Any]] = []
     for job in wrappers:
-        pod = pods_by_name.get(str(job.get("name", "")))
+        pod = _match_pod(job, pods_by_id, pods_by_name)
         if pod and pod["id"]:
             matched_pod_ids.add(pod["id"])
         remote = None

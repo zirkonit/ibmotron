@@ -51,3 +51,9 @@ def test_extract_metrics_and_gate_read_summary_shape() -> None:
     assert gate["fine_tuned_beats_few_shot_assemblability"] is True
     assert gate["returned_it_source_not_dominant"] is True
     assert gate["passes_plan_gate"] is True
+
+
+def test_load_json_output_accepts_summary_stdout() -> None:
+    payload = runpod_sweep._load_json_output('{"pod_id":"abc123","returncode":0}')
+
+    assert payload == {"pod_id": "abc123", "returncode": 0}
