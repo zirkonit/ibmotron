@@ -1,0 +1,26 @@
+set console -n log={{ console_log }}
+set cpu 2k
+att cdp0 -n -q {{ print_log }}
+runlimit {{ step_budget }} instructions
+set on
+on error ignore
+on runtime echof "\r\n*** RUNLIMIT_EXCEEDED ***\r\n"; exit 124
+
+set cdr1 wiring=8word
+att cdr1 -q -l {{ spit_p1 }}
+d csw 7019519999
+d ar 8000
+go
+
+det cdr1
+{% if input_deck %}
+att cdr1 -q {{ input_deck }}
+set cdr1 wiring=it
+{% endif %}
+
+att cdp1 -n -q {{ output_deck }}
+set cdp1 echo, print, wiring=it
+d csw 0
+d ar 1999
+go
+quit

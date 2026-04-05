@@ -1,0 +1,22 @@
+set console -n log={{ console_log }}
+set cpu 2k
+att cdp0 -n -q {{ print_log }}
+
+set cdr1 wiring=8word
+att cdr1 -q -l it/it_compiler.dck
+d csw 70 1951 3000
+d ar 8000
+go
+
+att cdr1 -q {{ source_deck }}
+set cdr1 wiring=it
+att cdp1 -n -q {{ pit_raw }}
+set cdp1 echo, print, wiring=it
+d csw 70 1999 3000
+d ar 8000
+go
+
+echo __ACCUP_BEGIN__
+ex accup
+echo __ACCUP_END__
+quit

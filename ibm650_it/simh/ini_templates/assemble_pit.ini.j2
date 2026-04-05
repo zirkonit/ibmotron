@@ -1,0 +1,22 @@
+set console -n log={{ console_log }}
+set cpu 2k
+att cdp0 -n -q {{ print_log }}
+
+set cdr1 wiring=8word
+att cdr1 -q -l it/soapII.dck
+d csw 7019519999
+d ar 8000
+go
+
+att cdr1 -q -l it/soapII_patch.dck
+d csw 7019519999
+d ar 8000
+go
+
+att cdr1 -q {{ pit_input }}
+set cdr1 wiring=soap
+att cdp1 -n -q {{ soap_output }}
+set cdp1 echo, print, wiring=soap
+d ar 1000
+go
+quit

@@ -1,0 +1,98 @@
+{
+  "generated_at": "2026-04-04T23:54:28Z",
+  "sources": [
+    {
+      "source_id": "open-simh/simh",
+      "family": "simh",
+      "commit": "4d38373206cd7c0ce8b94f5e16bd4429cb96430f",
+      "fetch_date": "2026-04-04T23:54:28Z",
+      "local_path": "third_party/simh",
+      "files": [
+        {
+          "path": "third_party/simh/I650/sw/run_it.ini",
+          "sha256": "d4d4a0d52000586f0f791c2a7a919bd02ccf0a82c6b270e4def101e2e727a1b6"
+        },
+        {
+          "path": "third_party/simh/I650/sw/run_soap.ini",
+          "sha256": "69c0fd10862be2334c1d7b9b0372f937affbcfc643ff4e5d2670591a7e54fe2e"
+        },
+        {
+          "path": "third_party/simh/I650/sw/it/it_compiler.dck",
+          "sha256": "8f8a44b5c1342c521a53032777593582009ad4be555baadf57ca725cb6cf5578"
+        },
+        {
+          "path": "third_party/simh/I650/sw/it/soapII.dck",
+          "sha256": "253907b8db0ee118fd6939c1a69f8b35dc8e224753bc2d88d89c1f112acfe3c5"
+        },
+        {
+          "path": "third_party/simh/I650/sw/it/soapII_patch.dck",
+          "sha256": "15bfca73b72acd6aaf4fb8d8b9e2df73395467b53aafb7fbc00afd6889dd2887"
+        },
+        {
+          "path": "third_party/simh/I650/sw/it/it_reservation_p1.dck",
+          "sha256": "b4083ca957369804fb78237c8f77c2c2b4ab439f2a07fcbc6ea8574087ad925b"
+        },
+        {
+          "path": "third_party/simh/I650/sw/it/it_package_p1.dck",
+          "sha256": "b3f38e150aa1583e4ac516cce90ec0f01cda44ba047e5cb1576224cb7e361762"
+        },
+        {
+          "path": "third_party/simh/I650/sw/it/it_example_1_src.txt",
+          "sha256": "776e6fc6578c8aea89c9ab267926f65db57272430debd70e24c1399d2dcec847"
+        },
+        {
+          "path": "third_party/simh/I650/sw/it/it_example_1_data.txt",
+          "sha256": "68c5725292e00025678b68d4b89fd9f0e8f709c56f4e90049376190ec3de1d84"
+        },
+        {
+          "path": "third_party/simh/I650/sw/it/it_example_2_src.txt",
+          "sha256": "808b68e6432d65c0889e1d0c6b378ac8c8d4ec913b02d7196f4d803ede6174ba"
+        }
+      ]
+    },
+    {
+      "source_id": "CarnegieInternalTranslator.pdf",
+      "family": "historical_doc",
+      "url": "https://archive.org/download/bitsavers_ibm650Carntor_16304233/CarnegieInternalTranslator.pdf",
+      "checksum_sha256": "3fb13afe2df4bba0889c51398c150644bd5ab32ee00435afbe687ae6d0869778",
+      "fetch_date": "2026-04-04T23:54:28Z",
+      "local_path": "third_party/source_cache/history/CarnegieInternalTranslator.pdf",
+      "notes_path": "third_party/source_cache/history/CarnegieInternalTranslator_djvu.txt"
+    },
+    {
+      "source_id": "IBM650_Manual_102726995-05-01-acc.pdf",
+      "family": "historical_doc",
+      "url": "https://archive.computerhistory.org/resources/access/text/2012/07/102726995-05-01-acc.pdf",
+      "checksum_sha256": "9526b8d2662671bed812313f034fb8d126230da7ab26cc16630c0e836b6e1d91",
+      "fetch_date": "2026-04-04T23:54:28Z",
+      "local_path": "third_party/source_cache/history/IBM650_Manual_102726995-05-01-acc.pdf"
+    },
+    {
+      "source_id": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
+      "family": "training_stack",
+      "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16/raw/main/README.md",
+      "commit_or_checksum": "dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f",
+      "last_modified": "2026-03-20T20:50:41.000Z",
+      "fetch_date": "2026-04-04T23:54:28Z",
+      "local_path": "third_party/source_cache/training/nvidia_NVIDIA-Nemotron-3-Nano-4B-BF16_README.md",
+      "api_path": "third_party/source_cache/training/nvidia_NVIDIA-Nemotron-3-Nano-4B-BF16.api.json",
+      "checksum_sha256": "06f349f02b364c5ff6d92562be82ddd190e00b7e161a749c297766d372068c18"
+    },
+    {
+      "source_id": "unsloth_nemotron_3",
+      "family": "training_stack",
+      "url": "https://unsloth.ai/docs/models/nemotron-3.md",
+      "checksum_sha256": "242964995690b4745b69393fb4e877f783e2b7765b2a2b456320c9059c2a9287",
+      "fetch_date": "2026-04-04T23:54:28Z",
+      "local_path": "third_party/source_cache/training/unsloth_nemotron_3.md"
+    },
+    {
+      "source_id": "unsloth_requirements",
+      "family": "training_stack",
+      "url": "https://unsloth.ai/docs/get-started/fine-tuning-for-beginners/unsloth-requirements.md",
+      "checksum_sha256": "ac273063025eefaf3283dd7751cc7d48040d1f80142080bab0ff052eea9c1b7b",
+      "fetch_date": "2026-04-04T23:54:28Z",
+      "local_path": "third_party/source_cache/training/unsloth_requirements.md"
+    }
+  ]
+}
