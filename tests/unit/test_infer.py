@@ -1,4 +1,10 @@
-from ibm650_it.training.infer import HfGenerationSession, _generate_with_hf_model, _hf_inference_runtime
+from ibm650_it.training.infer import (
+    HfGenerationSession,
+    StopOnTokenSequence,
+    _generate_with_hf_model,
+    _hf_inference_runtime,
+    _should_attempt_assembly,
+)
 
 
 class DummyCuda:
@@ -51,6 +57,7 @@ class DummyModel:
         assert kwargs["input_ids"] == [[10, 11]]
         assert kwargs["device"] == "cuda:0"
         assert kwargs["max_new_tokens"] == 7
+        assert kwargs["use_cache"] is True
         return [[10, 11, 21, 22, 23]]
 
 
@@ -79,7 +86,7 @@ def test_generate_with_hf_model_uses_session_model_and_strips_prompt_tokens() ->
         tokenizer=DummyTokenizerForGenerate(),
         model=DummyModel(),
         device="cuda:0",
-        stop_token_ids=[3, 4],
+        stop_token_sequences=[[3, 4], [5, 6]],
     )
 
     completion = _generate_with_hf_model(
@@ -89,3 +96,82 @@ def test_generate_with_hf_model_uses_session_model_and_strips_prompt_tokens() ->
     )
 
     assert completion == "21,22,23"
+
+
+def test_stop_on_token_sequence_accepts_multiple_variants() -> None:
+    criteria = StopOnTokenSequence([[7, 8], [10, 11, 12]])
+
+    class FakeRow(list):
+        def tolist(self) -> list[int]:
+            return list(self)
+
+    class FakeIds:
+        shape = (1, 5)
+
+        def __getitem__(self, idx: int):
+            if idx == 0:
+                return FakeRow([9, 10, 11, 12, 13])
+            raise IndexError
+
+    assert criteria(FakeIds(), None) is False
+
+    class MatchingIds:
+        shape = (1, 4)
+
+        def __getitem__(self, idx: int):
+            if idx == 0:
+                return FakeRow([1, 7, 8, 9])
+            raise IndexError
+
+    assert criteria(MatchingIds(), None) is False
+
+    class MatchingTailIds:
+        shape = (1, 4)
+
+        def __getitem__(self, idx: int):
+            if idx == 0:
+                return FakeRow([0, 7, 8, 7])
+            raise IndexError
+
+    assert criteria(MatchingTailIds(), None) is False
+
+    class MatchingLongTailIds:
+        shape = (1, 4)
+
+        def __getitem__(self, idx: int):
+            if idx == 0:
+                return FakeRow([9, 10, 11, 12])
+            raise IndexError
+
+    assert criteria(MatchingLongTailIds(), None) is True
+
+
+def test_should_attempt_assembly_skips_obvious_it_echo() -> None:
+    assert _should_attempt_assembly(
+        [
+            "0001+ y1 z 1j f",
+            "0002+ c1 z y1 s 7j f",
+            "0003+ y2 z c1 s 8j f",
+            "0004+ t y2 f",
+            "0005+ h ff",
+        ],
+        exact_match=False,
+    ) is False
+
+
+def test_should_attempt_assembly_keeps_symbolic_like_outputs() -> None:
+    assert _should_attempt_assembly(
+        [
+            "s0001 00 0000 laaaa 0000 0000",
+            "s0002 69 1995 xbbbb 0000 0000",
+            "s0003 65 1996 xcccc 0000 0000",
+            "s0004 24 1997 xdddd 0000 0000",
+            "s0005 69 1998 xeeee 0000 0000",
+            "s0006 24 1999 xffff 0000 0000",
+            "s0007 65 1991 xgggg 0000 0000",
+            "s0008 69 1992 xhhhh 0000 0000",
+            "s0009 24 1993 xiiii 0000 0000",
+            "s0010 69 1994 xjjjj 0000 0000",
+        ],
+        exact_match=False,
+    ) is True

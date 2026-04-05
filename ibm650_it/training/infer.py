@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import json
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -65,22 +66,49 @@ class HfGenerationSession:
     tokenizer: Any
     model: Any
     device: Any
-    stop_token_ids: list[int]
+    stop_token_sequences: list[list[int]]
 
 
 class StopOnTokenSequence:
-    def __init__(self, stop_token_ids: list[int]) -> None:
-        self.stop_token_ids = stop_token_ids
+    def __init__(self, stop_token_sequences: list[list[int]]) -> None:
+        self.stop_token_sequences = [sequence for sequence in stop_token_sequences if sequence]
 
     def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> bool:
         del scores, kwargs
-        if not self.stop_token_ids:
+        if not self.stop_token_sequences:
             return False
-        sequence_length = len(self.stop_token_ids)
-        if input_ids.shape[1] < sequence_length:
-            return False
-        tail = input_ids[0][-sequence_length:].tolist()
-        return tail == self.stop_token_ids
+        for sequence in self.stop_token_sequences:
+            sequence_length = len(sequence)
+            if input_ids.shape[1] < sequence_length:
+                continue
+            tail_slice = input_ids[0][-sequence_length:]
+            tail = tail_slice.tolist() if hasattr(tail_slice, "tolist") else list(tail_slice)
+            if tail == sequence:
+                return True
+        return False
+
+
+def _build_stop_token_sequences(tokenizer: Any) -> list[list[int]]:
+    variants = [
+        "</PIT>",
+        "\n</PIT>",
+        " </PIT>",
+        "</PIT>\n",
+        "\n</PIT>\n",
+        " </PIT>\n",
+    ]
+    sequences: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
+    for variant in variants:
+        encoded = tokenizer.encode(variant, add_special_tokens=False)
+        if not encoded:
+            continue
+        key = tuple(encoded)
+        if key in seen:
+            continue
+        sequences.append(encoded)
+        seen.add(key)
+    return sequences
 
 
 def _load_hf_generation_session(
@@ -119,14 +147,18 @@ def _load_hf_generation_session(
     if runtime["device_map"] is None:
         model = model.to(runtime["device"])
     model.eval()
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = True
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    stop_token_ids = tokenizer.encode("</PIT>", add_special_tokens=False)
+    if hasattr(model, "generation_config"):
+        model.generation_config.use_cache = True
+    stop_token_sequences = _build_stop_token_sequences(tokenizer)
     return HfGenerationSession(
         tokenizer=tokenizer,
         model=model,
         device=runtime["device"],
-        stop_token_ids=stop_token_ids,
+        stop_token_sequences=stop_token_sequences,
     )
 
 
@@ -158,20 +190,56 @@ def _generate_with_hf_model(
     stopping_criteria = None
     try:
         from transformers import StoppingCriteriaList
-        stopping_criteria = StoppingCriteriaList([StopOnTokenSequence(session.stop_token_ids)])
+        stopping_criteria = StoppingCriteriaList([StopOnTokenSequence(session.stop_token_sequences)])
     except ImportError:
         stopping_criteria = None
     inputs = session.tokenizer(prompt, return_tensors="pt").to(session.device)
-    generated = session.model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        pad_token_id=session.tokenizer.pad_token_id,
-        eos_token_id=session.tokenizer.eos_token_id,
-        stopping_criteria=stopping_criteria,
-    )
+    try:
+        import torch
+
+        context = torch.inference_mode()
+    except ImportError:
+        context = None
+    if context is None:
+        generated = session.model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=session.tokenizer.pad_token_id,
+            eos_token_id=session.tokenizer.eos_token_id,
+            stopping_criteria=stopping_criteria,
+            use_cache=True,
+        )
+    else:
+        with context:
+            generated = session.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=session.tokenizer.pad_token_id,
+                eos_token_id=session.tokenizer.eos_token_id,
+                stopping_criteria=stopping_criteria,
+                use_cache=True,
+            )
     new_tokens = generated[0][inputs["input_ids"].shape[1] :]
     return session.tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+
+def _should_attempt_assembly(candidate_cards: list[str], *, exact_match: bool) -> bool:
+    if exact_match:
+        return True
+    precheck = classify_failure(
+        candidate_cards=candidate_cards,
+        exact_match=False,
+        assemblable=False,
+        functional=False,
+        assemble_status=None,
+    )
+    return precheck not in {
+        "malformed_source_echo_in_output",
+        "returned_it_source_instead_of_pit",
+        "malformed_pit_card",
+    }
 
 
 def _predict_completion(
@@ -285,9 +353,11 @@ def run_inference(
         for reference in reference_records:
             if str(reference["id"]) in completed_ids:
                 continue
+            example_started = time.perf_counter()
             prediction_dir = output_dir / str(reference["id"])
             prediction_dir.mkdir(parents=True, exist_ok=True)
             source_text = resolve_record_path(str(reference["source"]["it_text_v1"]), reference_base).read_text(encoding="utf-8")
+            generation_started = time.perf_counter()
             completion_text, metadata, prompt = _predict_completion(
                 mode=mode,
                 source_text=source_text,
@@ -298,6 +368,7 @@ def run_inference(
                 hf_session=hf_session,
                 support_examples=support_examples,
             )
+            generation_seconds = time.perf_counter() - generation_started
             prompt_path = write_inference_request(prompt, prediction_dir / "prompt.txt")
             candidate_cards = completion_text.splitlines()
             candidate_path = write_deck_cards(prediction_dir / "pit_raw_canonical.dck", candidate_cards)
@@ -310,52 +381,55 @@ def run_inference(
             functional = False
             assemble_paths: dict[str, str | None] = {}
             run_paths: dict[str, str | None] = {}
+            validation_started = time.perf_counter()
 
-            try:
-                translation_body, reservation_cards = split_tail_cards(
-                    candidate_path,
-                    10,
-                    prediction_dir / "translation_body.dck",
-                    prediction_dir / "reservation_cards.dck",
-                )
-                pit_phase2 = runner.build_pit_phase2_input_p1(
-                    reservation_cards,
-                    translation_body,
-                    prediction_dir / "assemble" / "pit_phase2_input_p1.dck",
-                )
-                assemble = runner.assemble_pit(pit_phase2, prediction_dir / "assemble", timeout_seconds=timeout_seconds)
-                assemble_status = assemble.status
-                assemblable = assemble.status == "ok" and assemble.soap_output is not None
-                assemble_paths = {
-                    "pit_phase2_input_p1": str(assemble.pit_phase2_input_p1),
-                    "soap_output": str(assemble.soap_output) if assemble.soap_output is not None else None,
-                    "console_log": str(assemble.console_log),
-                    "stdout_log": str(assemble.stdout_log),
-                    "print_log": str(assemble.print_log),
-                }
-                if assemblable and assemble.soap_output is not None:
-                    spit = runner.build_spit_p1(assemble.soap_output, prediction_dir / "run" / "spit_p1.dck")
-                    input_deck_ref = reference["reference"]["run"].get("input_deck")
-                    input_deck = resolve_record_path(str(input_deck_ref), reference_base) if input_deck_ref else None
-                    run = runner.run_spit(
-                        spit.spit_p1,
-                        prediction_dir / "run",
-                        input_deck=input_deck,
-                        step_budget=step_budget,
-                        timeout_seconds=timeout_seconds,
+            if _should_attempt_assembly(candidate_cards, exact_match=bool(exact_metrics["exact_match"])):
+                try:
+                    translation_body, reservation_cards = split_tail_cards(
+                        candidate_path,
+                        10,
+                        prediction_dir / "translation_body.dck",
+                        prediction_dir / "reservation_cards.dck",
                     )
-                    run_status = run.status
-                    reference_output = resolve_record_path(str(reference["reference"]["run"]["output_deck"]), reference_base)
-                    functional = run.status == "ok" and run.output_deck is not None and compare_run_outputs(reference_output, run.output_deck)
-                    run_paths = {
-                        "spit_p1": str(run.spit_p1),
-                        "output_deck": str(run.output_deck) if run.output_deck is not None else None,
-                        "console_log": str(run.console_log),
-                        "stdout_log": str(run.stdout_log),
-                        "print_log": str(run.print_log),
+                    pit_phase2 = runner.build_pit_phase2_input_p1(
+                        reservation_cards,
+                        translation_body,
+                        prediction_dir / "assemble" / "pit_phase2_input_p1.dck",
+                    )
+                    assemble = runner.assemble_pit(pit_phase2, prediction_dir / "assemble", timeout_seconds=timeout_seconds)
+                    assemble_status = assemble.status
+                    assemblable = assemble.status == "ok" and assemble.soap_output is not None
+                    assemble_paths = {
+                        "pit_phase2_input_p1": str(assemble.pit_phase2_input_p1),
+                        "soap_output": str(assemble.soap_output) if assemble.soap_output is not None else None,
+                        "console_log": str(assemble.console_log),
+                        "stdout_log": str(assemble.stdout_log),
+                        "print_log": str(assemble.print_log),
                     }
-            except Exception as exc:
-                assemble_paths = {"error": type(exc).__name__}
+                    if assemblable and assemble.soap_output is not None:
+                        spit = runner.build_spit_p1(assemble.soap_output, prediction_dir / "run" / "spit_p1.dck")
+                        input_deck_ref = reference["reference"]["run"].get("input_deck")
+                        input_deck = resolve_record_path(str(input_deck_ref), reference_base) if input_deck_ref else None
+                        run = runner.run_spit(
+                            spit.spit_p1,
+                            prediction_dir / "run",
+                            input_deck=input_deck,
+                            step_budget=step_budget,
+                            timeout_seconds=timeout_seconds,
+                        )
+                        run_status = run.status
+                        reference_output = resolve_record_path(str(reference["reference"]["run"]["output_deck"]), reference_base)
+                        functional = run.status == "ok" and run.output_deck is not None and compare_run_outputs(reference_output, run.output_deck)
+                        run_paths = {
+                            "spit_p1": str(run.spit_p1),
+                            "output_deck": str(run.output_deck) if run.output_deck is not None else None,
+                            "console_log": str(run.console_log),
+                            "stdout_log": str(run.stdout_log),
+                            "print_log": str(run.print_log),
+                        }
+                except Exception as exc:
+                    assemble_paths = {"error": type(exc).__name__}
+            validation_seconds = time.perf_counter() - validation_started
 
             failure_type = classify_failure(
                 candidate_cards=candidate_cards,
@@ -383,6 +457,11 @@ def run_inference(
                 "assemblable": assemblable,
                 "functional": functional,
                 "failure_type": failure_type,
+                "timings": {
+                    "generation_seconds": generation_seconds,
+                    "validation_seconds": validation_seconds,
+                    "total_seconds": time.perf_counter() - example_started,
+                },
             }
             prediction_records.append(relativize_record_paths(prediction_record, output_dir))
             completed_ids.add(str(reference["id"]))
