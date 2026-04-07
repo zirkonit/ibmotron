@@ -7,9 +7,10 @@ from pathlib import Path
 from ibm650_it import REPO_ROOT
 from ibm650_it.dashboard import serve_dashboard
 from ibm650_it.dataset.build_records import build_record
-from ibm650_it.dataset.corpus import build_pilot_corpus, parse_band_counts
+from ibm650_it.dataset.corpus import build_pilot_corpus, build_stage_corpus, parse_band_counts
 from ibm650_it.dataset.subset import slice_dataset
 from ibm650_it.eval.archive import archive_failures
+from ibm650_it.eval.b1_failure_review import build_b1_failure_review
 from ibm650_it.eval.finalize import finalize_overfit_output, finalize_train_eval_output, reevaluate_and_report_mode
 from ibm650_it.eval.report import build_evaluation_report, compare_mode_reports
 from ibm650_it.eval.research_report import write_research_report
@@ -147,6 +148,18 @@ def cmd_build_pilot_corpus(args: argparse.Namespace) -> None:
     _print_json(summary)
 
 
+def cmd_build_stage_corpus(args: argparse.Namespace) -> None:
+    summary = build_stage_corpus(
+        stage=args.stage,
+        output_root=Path(args.output),
+        workers=args.workers,
+        max_attempts_per_band=args.max_attempts_per_band,
+        include_historical_golden=args.include_historical_golden,
+        resume=args.resume,
+    )
+    _print_json(summary)
+
+
 def cmd_slice_dataset(args: argparse.Namespace) -> None:
     summary = slice_dataset(
         source_root=Path(args.source_root),
@@ -227,6 +240,15 @@ def cmd_reevaluate_predictions(args: argparse.Namespace) -> None:
         repo_root=REPO_ROOT,
         step_budget=args.step_budget,
         timeout_seconds=args.timeout_seconds,
+    )
+    _print_json(summary)
+
+
+def cmd_review_b1_failures(args: argparse.Namespace) -> None:
+    summary = build_b1_failure_review(
+        reference_index=Path(args.reference_index),
+        prediction_index=Path(args.prediction_index),
+        output_root=Path(args.output),
     )
     _print_json(summary)
 
@@ -506,6 +528,15 @@ def build_parser() -> argparse.ArgumentParser:
     pilot.add_argument("--resume", action="store_true")
     pilot.set_defaults(func=cmd_build_pilot_corpus)
 
+    stage = subparsers.add_parser("build-stage-corpus")
+    stage.add_argument("--stage", choices=["2k", "5k", "10k"], required=True)
+    stage.add_argument("--output", required=True)
+    stage.add_argument("--workers", type=int, default=4)
+    stage.add_argument("--max-attempts-per-band", type=int)
+    stage.add_argument("--include-historical-golden", action="store_true")
+    stage.add_argument("--resume", action="store_true")
+    stage.set_defaults(func=cmd_build_stage_corpus)
+
     subset = subparsers.add_parser("slice-dataset")
     subset.add_argument("--source-root", required=True)
     subset.add_argument("--output", required=True)
@@ -573,6 +604,12 @@ def build_parser() -> argparse.ArgumentParser:
     reevaluate.add_argument("--timeout-seconds", type=int, default=30)
     reevaluate.set_defaults(func=cmd_reevaluate_predictions)
 
+    review_b1 = subparsers.add_parser("review-b1-failures")
+    review_b1.add_argument("--reference-index", required=True)
+    review_b1.add_argument("--prediction-index", required=True)
+    review_b1.add_argument("--output", required=True)
+    review_b1.set_defaults(func=cmd_review_b1_failures)
+
     record = subparsers.add_parser("build-record")
     record.add_argument("--source", required=True)
     record.add_argument("--output", required=True)
@@ -618,11 +655,11 @@ def build_parser() -> argparse.ArgumentParser:
     train_eval = subparsers.add_parser("train-eval")
     train_eval.add_argument("--dataset-root", required=True)
     train_eval.add_argument("--output", required=True)
-    train_eval.add_argument("--backend", default="smoke")
+    train_eval.add_argument("--backend", default="transformers_qlora")
     train_eval.add_argument("--model-name", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
-    train_eval.add_argument("--qlora-bits", type=int, default=4)
-    train_eval.add_argument("--learning-rate", type=float, default=1e-4)
-    train_eval.add_argument("--epochs", type=int, default=3)
+    train_eval.add_argument("--qlora-bits", type=int, default=0)
+    train_eval.add_argument("--learning-rate", type=float, default=2e-4)
+    train_eval.add_argument("--epochs", type=int, default=5)
     train_eval.add_argument("--max-seq-length", type=int, default=4096)
     train_eval.add_argument("--per-device-train-batch-size", type=int, default=1)
     train_eval.add_argument("--gradient-accumulation-steps", type=int, default=8)
@@ -667,11 +704,11 @@ def build_parser() -> argparse.ArgumentParser:
     overfit.add_argument("--dataset-index", required=True)
     overfit.add_argument("--output", required=True)
     overfit.add_argument("--example-count", type=int, default=16)
-    overfit.add_argument("--backend", default="smoke")
+    overfit.add_argument("--backend", default="transformers_qlora")
     overfit.add_argument("--model-name", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
-    overfit.add_argument("--qlora-bits", type=int, default=4)
-    overfit.add_argument("--learning-rate", type=float, default=1e-4)
-    overfit.add_argument("--epochs", type=int, default=3)
+    overfit.add_argument("--qlora-bits", type=int, default=0)
+    overfit.add_argument("--learning-rate", type=float, default=2e-4)
+    overfit.add_argument("--epochs", type=int, default=5)
     overfit.add_argument("--max-seq-length", type=int, default=4096)
     overfit.add_argument("--per-device-train-batch-size", type=int, default=1)
     overfit.add_argument("--gradient-accumulation-steps", type=int, default=8)

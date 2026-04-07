@@ -6,6 +6,7 @@ from typing import Any
 
 from ibm650_it import REPO_ROOT
 from ibm650_it.eval.archive import archive_failures
+from ibm650_it.eval.locking import finalize_session
 from ibm650_it.eval.reevaluate import reevaluate_prediction_records
 from ibm650_it.eval.report import build_evaluation_report, compare_mode_reports
 
@@ -62,36 +63,38 @@ def finalize_train_eval_output(
     timeout_seconds: int = 30,
 ) -> dict[str, Any]:
     output_root.mkdir(parents=True, exist_ok=True)
-    eval_index = dataset_root / "splits" / eval_split
-    existing_summary_path = output_root / "summary.json"
-    existing_summary = json.loads(existing_summary_path.read_text(encoding="utf-8")) if existing_summary_path.exists() else {}
+    with finalize_session(output_root, scope="train_eval") as session:
+        eval_index = dataset_root / "splits" / eval_split
+        existing_summary_path = output_root / "summary.json"
+        existing_summary = json.loads(existing_summary_path.read_text(encoding="utf-8")) if existing_summary_path.exists() else {}
 
-    evaluations: dict[str, Any] = {}
-    reports: dict[str, dict[str, Any]] = {}
-    for mode in ["zero_shot", "few_shot", "fine_tuned"]:
-        mode_result = reevaluate_and_report_mode(
-            reference_index=eval_index,
-            prediction_index=output_root / "predictions" / mode / "predictions.jsonl",
-            prediction_output_dir=output_root / "predictions" / mode,
-            report_path=output_root / "reports" / f"{mode}.json",
-            failure_output_dir=output_root / "failures" / mode,
-            failure_archive_limit=failure_archive_limit,
-            repo_root=repo_root,
-            step_budget=step_budget,
-            timeout_seconds=timeout_seconds,
-        )
-        evaluations[mode] = mode_result
-        reports[mode] = mode_result["report"]
+        evaluations: dict[str, Any] = {}
+        reports: dict[str, dict[str, Any]] = {}
+        for mode in ["zero_shot", "few_shot", "fine_tuned"]:
+            session.write_state(status="running", current_mode=mode)
+            mode_result = reevaluate_and_report_mode(
+                reference_index=eval_index,
+                prediction_index=output_root / "predictions" / mode / "predictions.jsonl",
+                prediction_output_dir=output_root / "predictions" / mode,
+                report_path=output_root / "reports" / f"{mode}.json",
+                failure_output_dir=output_root / "failures" / mode,
+                failure_archive_limit=failure_archive_limit,
+                repo_root=repo_root,
+                step_budget=step_budget,
+                timeout_seconds=timeout_seconds,
+            )
+            evaluations[mode] = mode_result
+            reports[mode] = mode_result["report"]
 
-    summary = {
-        "records_written": existing_summary.get("records_written"),
-        "train": existing_summary.get("train"),
-        "evaluations": evaluations,
-        "baseline_delta": compare_mode_reports(reports),
-        "eval_mode": "local_cpu_reevaluate",
-    }
-    existing_summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    return summary
+        summary = {
+            "records_written": existing_summary.get("records_written"),
+            "train": existing_summary.get("train"),
+            "evaluations": evaluations,
+            "baseline_delta": compare_mode_reports(reports),
+            "eval_mode": "local_cpu_reevaluate",
+        }
+        existing_summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        return summary
 
 
 def finalize_overfit_output(
@@ -104,26 +107,28 @@ def finalize_overfit_output(
     timeout_seconds: int = 30,
 ) -> dict[str, Any]:
     output_root.mkdir(parents=True, exist_ok=True)
-    existing_summary_path = output_root / "summary.json"
-    existing_summary = json.loads(existing_summary_path.read_text(encoding="utf-8")) if existing_summary_path.exists() else {}
+    with finalize_session(output_root, scope="overfit") as session:
+        existing_summary_path = output_root / "summary.json"
+        existing_summary = json.loads(existing_summary_path.read_text(encoding="utf-8")) if existing_summary_path.exists() else {}
 
-    fine_tuned = reevaluate_and_report_mode(
-        reference_index=dataset_index,
-        prediction_index=output_root / "predictions" / "fine_tuned" / "predictions.jsonl",
-        prediction_output_dir=output_root / "predictions" / "fine_tuned",
-        report_path=output_root / "reports" / "fine_tuned.json",
-        failure_output_dir=output_root / "failures" / "fine_tuned",
-        failure_archive_limit=failure_archive_limit,
-        repo_root=repo_root,
-        step_budget=step_budget,
-        timeout_seconds=timeout_seconds,
-    )
-    summary = {
-        "records_written": existing_summary.get("records_written"),
-        "example_count": existing_summary.get("example_count"),
-        "train": existing_summary.get("train"),
-        "fine_tuned": fine_tuned,
-        "eval_mode": "local_cpu_reevaluate",
-    }
-    existing_summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    return summary
+        session.write_state(status="running", current_mode="fine_tuned")
+        fine_tuned = reevaluate_and_report_mode(
+            reference_index=dataset_index,
+            prediction_index=output_root / "predictions" / "fine_tuned" / "predictions.jsonl",
+            prediction_output_dir=output_root / "predictions" / "fine_tuned",
+            report_path=output_root / "reports" / "fine_tuned.json",
+            failure_output_dir=output_root / "failures" / "fine_tuned",
+            failure_archive_limit=failure_archive_limit,
+            repo_root=repo_root,
+            step_budget=step_budget,
+            timeout_seconds=timeout_seconds,
+        )
+        summary = {
+            "records_written": existing_summary.get("records_written"),
+            "example_count": existing_summary.get("example_count"),
+            "train": existing_summary.get("train"),
+            "fine_tuned": fine_tuned,
+            "eval_mode": "local_cpu_reevaluate",
+        }
+        existing_summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        return summary

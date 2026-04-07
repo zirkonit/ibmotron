@@ -32,16 +32,18 @@ ibm650-it run-spit --spit-p1 artifacts/example2_run/spit_p1.dck --output artifac
 ibm650-it pipeline --source third_party/simh/I650/sw/it/it_example_2_src.txt --output artifacts/example2_pipeline
 ibm650-it generate-accepted --band B1 --count 10 --output artifacts/datasets/b1_pilot
 ibm650-it build-pilot-corpus --output artifacts/datasets/pilot_1000 --total-count 1000 --workers 8
+ibm650-it build-stage-corpus --stage 2k --output artifacts/datasets/stage_2k --workers 8
 ibm650-it prepare-sft --dataset-index artifacts/datasets/pilot_1000/splits/synthetic_train.jsonl --output artifacts/datasets/pilot_1000/sft/train.jsonl --limit 128
 ibm650-it train-model --sft-jsonl artifacts/datasets/pilot_1000/sft/train.jsonl --output artifacts/models/m4_smoke
 ibm650-it run-inference --reference-index artifacts/datasets/pilot_1000/splits/synthetic_dev.jsonl --mode fine_tuned --model artifacts/models/m4_smoke --output artifacts/eval_reports/m4_fine
 ibm650-it reevaluate-predictions --reference-index artifacts/datasets/pilot_1000/splits/synthetic_dev.jsonl --prediction-index artifacts/eval_reports/m4_fine/predictions.jsonl --output artifacts/eval_reports/m4_fine
+ibm650-it review-b1-failures --reference-index artifacts/datasets/pilot_remote_128_20/splits/synthetic_dev.jsonl --prediction-index artifacts/eval_reports/sweeps/subset_128_20_a40_20260405_1137/e5_lr0p0002/predictions/fine_tuned/predictions.jsonl --output artifacts/eval_reports/reviews/b1_best_run
 ibm650-it eval-report --reference-index artifacts/datasets/pilot_1000/splits/synthetic_dev.jsonl --prediction-index artifacts/eval_reports/m4_fine/predictions.jsonl
-ibm650-it train-eval --dataset-root artifacts/datasets/pilot_1000 --output artifacts/eval_reports/full_smoke --backend smoke --limit 5
+ibm650-it train-eval --dataset-root artifacts/datasets/pilot_remote_128_20 --output artifacts/eval_reports/baseline_real --limit 20
 ibm650-it smoke-train-eval --dataset-root artifacts/datasets/pilot_1000 --output artifacts/eval_reports/m4_smoke --limit 5
-ibm650-it overfit-sanity --dataset-index artifacts/datasets/pilot_1000/splits/synthetic_train.jsonl --output artifacts/eval_reports/overfit_smoke --example-count 16 --backend smoke
-python3 scripts/runpod_train_eval.py --dataset-name pilot_remote_quick --backend transformers_qlora --max-examples 4 --limit 1
-python3 scripts/runpod_sweep.py --dataset-name pilot_remote_128_20 --gpu-id "NVIDIA A40" --cloud-type SECURE
+ibm650-it overfit-sanity --dataset-index artifacts/datasets/pilot_remote_128_20/splits/synthetic_train.jsonl --output artifacts/eval_reports/overfit_real --example-count 32
+python3 scripts/runpod_train_eval.py --dataset-name pilot_remote_128_20 --limit 20
+python3 scripts/runpod_sweep.py --dataset-name pilot_remote_128_20 --gpu-id "NVIDIA A40" --cloud-type SECURE --reuse-single-pod
 ibm650-it dashboard --host 127.0.0.1 --port 8765 --refresh-seconds 10
 ibm650-it smoke-examples --output artifacts/smoke_examples
 ```
@@ -119,24 +121,51 @@ The page shows:
 
 - active local launcher processes
 - active or orphan Runpod pods
+- explicit job phases: `remote_bootstrap`, `remote_train`, `remote_generate`, `local_reevaluate`, `complete`, `failed`
 - remote generation progress for `zero_shot`, `few_shot`, and `fine_tuned`
 - GPU utilization reported by `nvidia-smi`
 - recent local run summaries and top-line metrics
 
 ## Runpod Sweep
 
-Use the sweep runner to execute the planned same-slice `128/20` grid over epochs and learning rates:
+Use the sweep runner to execute the planned same-slice `128/20` LR continuation grid around the frozen `5 epochs @ 2e-4` baseline:
 
 ```bash
 python3 scripts/runpod_sweep.py \
   --dataset-name pilot_remote_128_20 \
   --gpu-id "NVIDIA A40" \
   --cloud-type SECURE \
-  --epochs 3 5 \
-  --learning-rates 1e-4 5e-5
+  --reuse-single-pod \
+  --epochs 5 \
+  --learning-rates 3e-4 4e-4
 ```
 
-The script writes a sweep manifest at `artifacts/eval_reports/sweeps/<name>/manifest.json` and each run keeps its own full local output directory under that sweep root.
+The script writes a sweep manifest at `artifacts/eval_reports/sweeps/<name>/manifest.json`, compares each candidate run against the current `2e-4` baseline, records Gate A status, and chooses a winner using:
+
+1. higher functional equivalence
+2. then higher exact match
+3. then higher per-card exact
+4. with `assemblability >= 95%`
+
+Each run keeps its own full local output directory under that sweep root.
+
+## B1 Failure Review
+
+Use the B1 reviewer on the winning held-out run before scaling the corpus:
+
+```bash
+ibm650-it review-b1-failures \
+  --reference-index artifacts/datasets/pilot_remote_128_20/splits/synthetic_dev.jsonl \
+  --prediction-index artifacts/eval_reports/sweeps/subset_128_20_a40_20260405_1137/e5_lr0p0002/predictions/fine_tuned/predictions.jsonl \
+  --output artifacts/eval_reports/reviews/b1_best_run
+```
+
+The review writes:
+
+- `cases.jsonl` with one classification per non-exact `B1` example
+- `summary.json` with category counts
+- `review.md` with a concise operator-facing summary
+- `selected_failures/` with 10 representative archived cases
 
 ## Overfit Sanity Check
 

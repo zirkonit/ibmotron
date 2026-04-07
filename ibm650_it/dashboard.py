@@ -17,6 +17,7 @@ from typing import Any
 
 from ibm650_it import REPO_ROOT
 from ibm650_it.cloud.runpod import RunpodCtl
+from ibm650_it.eval.locking import FINALIZE_STATE_FILENAME
 
 
 HTML_PAGE = """<!doctype html>
@@ -210,6 +211,7 @@ HTML_PAGE = """<!doctype html>
           <div class="row"><div class="label">Local PID</div><div class="value mono">${safe(job.pid)} · ${safe(job.elapsed)}</div></div>
           <div class="row"><div class="label">Pod</div><div class="value mono">${safe(job.pod_id || "")} ${job.pod ? `· ${safe(job.pod.gpu || "")} · $${safe(job.pod.cost_per_hr)}/hr` : ""}</div></div>
           <div class="row"><div class="label">Remote</div><div class="value">${job.remote ? safe(job.remote.phase || "unknown") : '<span class="muted">unavailable</span>'}</div></div>
+          <div class="row"><div class="label">Local</div><div class="value">${job.local ? safe(job.local.phase || "unknown") : '<span class="muted">n/a</span>'}</div></div>
           <div class="row"><div class="label">Progress</div><div class="value">${renderProgress(job.remote ? job.remote.progress : {})}</div></div>
           <div class="row"><div class="label">GPU</div><div class="value mono">${job.remote && job.remote.gpu ? safe(job.remote.gpu) : '<span class="muted">n/a</span>'}</div></div>
           <div class="row"><div class="label">Output</div><div class="value mono">${safe(job.remote_output)}</div></div>
@@ -422,6 +424,55 @@ def collect_pods() -> list[dict[str, Any]]:
     return pods
 
 
+def _expected_modes(run_mode: str) -> list[str]:
+    if run_mode == "overfit-sanity":
+        return ["fine_tuned"]
+    if run_mode == "thinking-ablation":
+        return ["thinking_on", "thinking_off"]
+    return ["zero_shot", "few_shot", "fine_tuned"]
+
+
+def _inspect_local_output(local_output: str | None, run_mode: str) -> dict[str, Any] | None:
+    if not local_output:
+        return None
+    root = REPO_ROOT / local_output
+    if not root.exists():
+        return None
+
+    state_path = root / FINALIZE_STATE_FILENAME
+    state = None
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            state = None
+
+    modes = _expected_modes(run_mode)
+    reports = {
+        mode: {
+            "exists": (root / "reports" / f"{mode}.json").exists(),
+        }
+        for mode in modes
+    }
+    summary_exists = (root / "summary.json").exists()
+    completed_reports = sum(1 for item in reports.values() if item["exists"])
+    if state is not None:
+        phase = "failed" if state.get("status") == "failed" else "local_reevaluate"
+    elif summary_exists and completed_reports == len(modes):
+        phase = "complete"
+    elif summary_exists or completed_reports:
+        phase = "local_reevaluate"
+    else:
+        phase = "pending"
+    return {
+        "root": str(root),
+        "phase": phase,
+        "summary_exists": summary_exists,
+        "state": state,
+        "reports": reports,
+    }
+
+
 def _ssh_remote_status(pod_id: str, remote_output: str, run_mode: str, expected_count: int | None, timeout_seconds: int) -> dict[str, Any]:
     ctl = RunpodCtl()
     info = ctl.ssh_info(pod_id)
@@ -507,37 +558,69 @@ print(json.dumps(data))
 
 
 def _phase_class(phase: str) -> str:
-    if phase in {"remote_complete", "syncing_back"}:
+    if phase in {"complete"}:
         return "good"
-    if phase in {"packaging", "uploading", "bootstrap", "training", "zero_shot", "few_shot", "fine_tuned"}:
+    if phase in {"remote_bootstrap", "remote_train", "remote_generate", "local_reevaluate"}:
         return "accent"
-    if phase in {"remote_error", "runpod_error"}:
+    if phase in {"failed", "runpod_error"}:
         return "bad"
     return "warn"
 
 
-def _derive_phase(job: dict[str, Any], remote: dict[str, Any] | None) -> str:
-    archive_size = _read_archive_size(job["pid"])
-    if remote is None:
-        return "packaging" if archive_size else "launching"
-    if remote.get("error"):
-        return "remote_error"
-    if not remote.get("repo_exists"):
-        return "packaging" if not remote.get("tgz_exists") else "uploading"
-    if remote.get("repo_exists") and not remote.get("output_exists"):
-        return "bootstrap"
-    if not remote.get("active_process"):
-        return "remote_complete" if remote.get("output_exists") else "bootstrap"
+def _derive_remote_subphase(remote: dict[str, Any] | None) -> str | None:
+    if remote is None or remote.get("error"):
+        return None
     progress = remote.get("progress", {})
-    if progress.get("fine_tuned", {}).get("lines") and progress["fine_tuned"]["expected"] and progress["fine_tuned"]["lines"] < progress["fine_tuned"]["expected"]:
-        return "fine_tuned"
-    if progress.get("few_shot", {}).get("lines") and progress["few_shot"]["expected"] and progress["few_shot"]["lines"] < progress["few_shot"]["expected"]:
-        return "few_shot"
-    if progress.get("zero_shot", {}).get("lines") and progress["zero_shot"]["expected"] and progress["zero_shot"]["lines"] < progress["zero_shot"]["expected"]:
-        return "zero_shot"
-    if remote.get("output_exists"):
+    for mode in ["fine_tuned", "few_shot", "zero_shot"]:
+        mode_progress = progress.get(mode, {})
+        expected = mode_progress.get("expected")
+        lines = mode_progress.get("lines")
+        if lines and expected and lines < expected:
+            return mode
+        if expected and lines == expected:
+            continue
+    if remote.get("active_process"):
         return "training"
-    return "bootstrap"
+    return None
+
+
+def _derive_remote_phase(remote: dict[str, Any] | None) -> str | None:
+    if remote is None:
+        return None
+    if remote.get("error"):
+        return "failed"
+    if not remote.get("repo_exists"):
+        return "remote_bootstrap"
+    if not remote.get("output_exists"):
+        return "remote_train"
+    if remote.get("active_process"):
+        return _derive_remote_subphase(remote) or "remote_train"
+    if remote.get("output_exists"):
+        return "remote_complete"
+    return "remote_bootstrap"
+
+
+def _derive_phase(job: dict[str, Any], remote: dict[str, Any] | None, local: dict[str, Any] | None) -> str:
+    archive_size = _read_archive_size(job["pid"])
+    if local is not None and local.get("phase") == "failed":
+        return "failed"
+    if local is not None and local.get("phase") == "local_reevaluate":
+        return "local_reevaluate"
+    if local is not None and local.get("phase") == "complete":
+        return "complete"
+    if remote is None:
+        return "remote_bootstrap" if archive_size else "launching"
+    if remote.get("error"):
+        return "failed"
+    if not remote.get("repo_exists"):
+        return "remote_bootstrap"
+    if not remote.get("output_exists"):
+        return "remote_train"
+    if remote.get("active_process"):
+        return "remote_generate" if _derive_remote_subphase(remote) else "remote_train"
+    if local is not None and local.get("summary_exists"):
+        return "local_reevaluate"
+    return "remote_generate"
 
 
 def _match_pod(job: dict[str, Any], pods_by_id: dict[str, dict[str, Any]], pods_by_name: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
@@ -555,7 +638,9 @@ def _match_pod(job: dict[str, Any], pods_by_id: dict[str, dict[str, Any]], pods_
 def collect_recent_runs(limit: int = 8) -> list[dict[str, Any]]:
     eval_root = REPO_ROOT / "artifacts" / "eval_reports"
     runs: list[dict[str, Any]] = []
-    for summary_path in sorted(eval_root.glob("*/summary.json"), key=lambda path: path.stat().st_mtime, reverse=True):
+    for summary_path in sorted(eval_root.rglob("summary.json"), key=lambda path: path.stat().st_mtime, reverse=True):
+        if any(part in {"predictions", "reports", "failures", "model", "sft"} for part in summary_path.parts):
+            continue
         try:
             payload = json.loads(summary_path.read_text(encoding="utf-8"))
         except Exception:
@@ -597,13 +682,17 @@ def collect_dashboard_status(config: DashboardConfig) -> dict[str, Any]:
                 expected,
                 config.remote_timeout_seconds,
             )
-        phase = _derive_phase(job, remote)
+            if remote is not None:
+                remote["phase"] = _derive_remote_phase(remote)
+        local = _inspect_local_output(str(job.get("local_output") or ""), str(job.get("run_mode") or ""))
+        phase = _derive_phase(job, remote, local)
         active_jobs.append(
             {
                 **job,
                 "pod_id": pod["id"] if pod else None,
                 "pod": pod,
                 "remote": remote,
+                "local": local,
                 "phase": phase,
                 "phase_class": _phase_class(phase),
             }

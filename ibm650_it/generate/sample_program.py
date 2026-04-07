@@ -9,7 +9,7 @@ from pathlib import Path
 from ibm650_it.dataset.build_records import build_record
 from ibm650_it.generate.bands import BANDS
 from ibm650_it.simh.runner import SimhRunner
-from ibm650_it.source.ast import Add, Assign, FloatConst, Halt, IntConst, Mul, Program, Punch, Var
+from ibm650_it.source.ast import Add, Assign, FloatConst, Goto, Halt, IfGoto, IntConst, Iterate, Mul, Program, Punch, Statement, Var
 from ibm650_it.source.render_it_card80 import render_simh_source_deck
 from ibm650_it.source.bounds import compute_header
 from ibm650_it.source.render_it_text import render_program
@@ -17,6 +17,18 @@ from ibm650_it.source.render_it_text import render_program
 
 def _float_literal(rng: random.Random) -> FloatConst:
     return FloatConst(f"{rng.randint(1, 9)}j")
+
+
+def _int_literal(rng: random.Random, lo: int = 1, hi: int = 6) -> IntConst:
+    return IntConst(rng.randint(lo, hi))
+
+
+def _loop_bounds(rng: random.Random, *, start_hi: int = 3, step_hi: int = 2, iterations_hi: int = 5) -> tuple[IntConst, IntConst, IntConst]:
+    start = rng.randint(1, start_hi)
+    step = rng.randint(1, step_hi)
+    iterations = rng.randint(2, iterations_hi)
+    stop = start + step * (iterations - 1)
+    return IntConst(start), IntConst(step), IntConst(stop)
 
 
 def _generate_b0(seed: int) -> Program:
@@ -36,20 +48,101 @@ def _generate_b0(seed: int) -> Program:
 
 def _generate_b1(seed: int) -> Program:
     rng = random.Random(seed)
-    statements = [
-        Assign(1, Var("i", IntConst(1)), IntConst(rng.randint(1, 4))),
+    statements: list[Statement] = [
+        Assign(1, Var("i", IntConst(1)), _int_literal(rng, 1, 4)),
         Assign(2, Var("c", IntConst(1)), _float_literal(rng)),
         Assign(3, Var("y", IntConst(1)), Add(Var("c", IntConst(1)), _float_literal(rng))),
         Assign(4, Var("y", IntConst(2)), Mul(Var("y", IntConst(1)), _float_literal(rng))),
+        Assign(5, Var("c", IntConst(2)), Add(Var("y", IntConst(2)), Var("c", IntConst(1)))),
     ]
-    if rng.choice([True, False]):
-        statements.append(Assign(5, Var("c", IntConst(2)), Add(Var("y", IntConst(2)), Var("c", IntConst(1)))))
-        output_vars = (Var("y", IntConst(2)), Var("c", IntConst(2)))
+    next_stmt = 6
+    output_vars = [Var("y", IntConst(2)), Var("c", IntConst(2))]
+    variant = rng.choice(["extra_i", "extra_y", "extra_c"])
+    if variant == "extra_i":
+        statements.append(Assign(next_stmt, Var("i", IntConst(2)), Add(Var("i", IntConst(1)), _int_literal(rng, 1, 3))))
+        output_vars.append(Var("i", IntConst(2)))
+    elif variant == "extra_y":
+        statements.append(Assign(next_stmt, Var("y", IntConst(3)), Add(Var("c", IntConst(2)), _float_literal(rng))))
+        output_vars.append(Var("y", IntConst(3)))
     else:
-        statements.append(Assign(5, Var("y", IntConst(3)), Add(Var("y", IntConst(2)), _float_literal(rng))))
-        output_vars = (Var("y", IntConst(2)), Var("y", IntConst(3)))
-    statements.append(Punch(6, output_vars))
-    statements.append(Halt(7))
+        statements.append(Assign(next_stmt, Var("c", IntConst(3)), Add(Var("c", IntConst(2)), _float_literal(rng))))
+        output_vars.append(Var("c", IntConst(3)))
+    next_stmt += 1
+
+    statements.append(Punch(next_stmt, tuple(output_vars[:4])))
+    statements.append(Halt(next_stmt + 1))
+    program = Program(statements=tuple(statements))
+    return Program(statements=program.statements, header=compute_header(program))
+
+
+def _generate_b2(seed: int) -> Program:
+    rng = random.Random(seed)
+    limit = rng.randint(4, 7)
+    branch_point = rng.randint(2, limit - 1)
+    inc_primary = _float_literal(rng)
+    inc_secondary = _float_literal(rng)
+    statements = [
+        Assign(1, Var("i", IntConst(1)), IntConst(0)),
+        Assign(2, Var("c", IntConst(1)), FloatConst("0j")),
+        Assign(3, Var("i", IntConst(1)), Add(Var("i", IntConst(1)), IntConst(1))),
+        IfGoto(4, 9, Var("i", IntConst(1)), "w", IntConst(limit)),
+        IfGoto(5, 7, Var("i", IntConst(1)), "u", IntConst(branch_point)),
+        Assign(6, Var("c", IntConst(1)), Add(Var("c", IntConst(1)), inc_primary)),
+        Assign(7, Var("c", IntConst(1)), Add(Var("c", IntConst(1)), inc_secondary)),
+        Goto(8, 3),
+        Punch(9, (Var("i", IntConst(1)), Var("c", IntConst(1)))),
+        Halt(10),
+    ]
+    program = Program(statements=tuple(statements))
+    return Program(statements=program.statements, header=compute_header(program))
+
+
+def _generate_b3(seed: int) -> Program:
+    rng = random.Random(seed)
+    start_expr, step_expr, stop_expr = _loop_bounds(rng)
+    family = rng.choice(["indexed_sum", "progressive_store", "postmix_store"])
+
+    if family == "indexed_sum":
+        base = rng.choice([FloatConst("0j"), _float_literal(rng), _float_literal(rng)])
+        increment = _float_literal(rng)
+        bias = _float_literal(rng)
+        statements = [
+            Assign(1, Var("y", IntConst(1)), base),
+            Iterate(2, 5, Var("i", IntConst(1)), start_expr, step_expr, stop_expr),
+            Assign(3, Var("c", Var("i", IntConst(1))), increment),
+            Assign(4, Var("y", IntConst(1)), Add(Var("y", IntConst(1)), Var("c", Var("i", IntConst(1))))),
+            Assign(5, Var("c", IntConst(1)), Add(Var("y", IntConst(1)), bias)),
+            Punch(6, (Var("y", IntConst(1)), Var("c", IntConst(1)))),
+            Halt(7),
+        ]
+    elif family == "progressive_store":
+        current = _float_literal(rng)
+        delta = _float_literal(rng)
+        base = rng.choice([FloatConst("0j"), _float_literal(rng)])
+        statements = [
+            Assign(1, Var("c", IntConst(1)), current),
+            Assign(2, Var("y", IntConst(1)), base),
+            Iterate(3, 6, Var("i", IntConst(1)), start_expr, step_expr, stop_expr),
+            Assign(4, Var("c", Var("i", IntConst(1))), Var("c", IntConst(1))),
+            Assign(5, Var("y", IntConst(1)), Add(Var("y", IntConst(1)), Var("c", Var("i", IntConst(1))))),
+            Assign(6, Var("c", IntConst(1)), Add(Var("c", IntConst(1)), delta)),
+            Punch(7, (Var("y", IntConst(1)), Var("c", IntConst(1)))),
+            Halt(8),
+        ]
+    else:
+        base = rng.choice([FloatConst("0j"), _float_literal(rng)])
+        increment = _float_literal(rng)
+        mix = _float_literal(rng)
+        statements = [
+            Assign(1, Var("y", IntConst(1)), base),
+            Assign(2, Var("c", IntConst(1)), mix),
+            Iterate(3, 5, Var("i", IntConst(1)), start_expr, step_expr, stop_expr),
+            Assign(4, Var("c", Var("i", IntConst(1))), Add(Var("c", IntConst(1)), increment)),
+            Assign(5, Var("y", IntConst(1)), Add(Var("y", IntConst(1)), Var("c", Var("i", IntConst(1))))),
+            Assign(6, Var("y", IntConst(2)), Add(Var("y", IntConst(1)), Var("c", IntConst(1)))),
+            Punch(7, (Var("y", IntConst(1)), Var("y", IntConst(2)))),
+            Halt(8),
+        ]
     program = Program(statements=tuple(statements))
     return Program(statements=program.statements, header=compute_header(program))
 
@@ -61,7 +154,21 @@ def generate_band_program(band: str, *, seed: int) -> Program:
         return _generate_b0(seed)
     if band == "B1":
         return _generate_b1(seed)
+    if band == "B2":
+        return _generate_b2(seed)
+    if band == "B3":
+        return _generate_b3(seed)
     raise NotImplementedError(f"{band} generation is not implemented yet")
+
+
+def _collect_var_features(expr: object, features: set[str]) -> None:
+    if isinstance(expr, Var):
+        if not isinstance(expr.index, IntConst):
+            features.add(f"indexed_{expr.cls}")
+        _collect_var_features(expr.index, features)
+    elif isinstance(expr, (Add, Mul)):
+        _collect_var_features(expr.lhs, features)
+        _collect_var_features(expr.rhs, features)
 
 
 def infer_features(program: Program) -> list[str]:
@@ -71,12 +178,28 @@ def infer_features(program: Program) -> list[str]:
             features.add("punch")
             if len(statement.vars) > 1:
                 features.add("multi_output")
+            for var in statement.vars:
+                _collect_var_features(var, features)
         if isinstance(statement, Assign):
             features.add(f"assign_{statement.target.cls}")
             if isinstance(statement.expr, Add):
                 features.add("add")
             if isinstance(statement.expr, Mul):
                 features.add("mul")
+            _collect_var_features(statement.target, features)
+            _collect_var_features(statement.expr, features)
+        if isinstance(statement, Goto):
+            features.add("goto")
+        if isinstance(statement, IfGoto):
+            features.add("if_goto")
+            _collect_var_features(statement.lhs, features)
+            _collect_var_features(statement.rhs, features)
+        if isinstance(statement, Iterate):
+            features.add("iterate")
+            _collect_var_features(statement.loop_var, features)
+            _collect_var_features(statement.start_expr, features)
+            _collect_var_features(statement.step_expr, features)
+            _collect_var_features(statement.stop_expr, features)
     return sorted(features)
 
 

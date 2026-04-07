@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -32,6 +33,10 @@ CAUSAL_CONV1D_WHEEL_URL = (
 )
 READY_MARKER = "/workspace/ibmotron/.ibmotron_ready.json"
 ARCHIVE_CACHE_DIR = REPO_ROOT / "artifacts" / "cache" / "runpod_archives"
+REAL_BASELINE_QLORA_BITS = 0
+REAL_BASELINE_LEARNING_RATE = 2e-4
+REAL_BASELINE_EPOCHS = 5
+REAL_BASELINE_MAX_NEW_TOKENS = 1024
 
 
 REMOTE_BASE_INCLUDE_PATHS = [
@@ -124,12 +129,39 @@ def _dataset_root_from_args(args: argparse.Namespace) -> Path:
     return REPO_ROOT / "artifacts" / "datasets" / args.dataset_name
 
 
+def _count_jsonl_records(path: Path) -> int:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    with path.open("r", encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
+
+
+def resolve_dataset_caps(args: argparse.Namespace) -> tuple[int | None, int | None]:
+    if args.run_mode == "overfit-sanity":
+        return args.example_count, args.example_count
+    if args.run_mode == "inference-only":
+        if args.limit is not None:
+            return None, args.limit
+        eval_index = _dataset_index_paths(args)[0]
+        return None, _count_jsonl_records(eval_index)
+    dataset_root = _dataset_root_from_args(args)
+    train_index = dataset_root / "splits" / args.train_split
+    eval_index = dataset_root / "splits" / args.eval_split
+    max_examples = args.max_examples if args.max_examples is not None else _count_jsonl_records(train_index)
+    limit = args.limit if args.limit is not None else _count_jsonl_records(eval_index)
+    return max_examples, limit
+
+
 def _dataset_index_paths(args: argparse.Namespace) -> list[Path]:
     dataset_root = _dataset_root_from_args(args)
     if args.run_mode == "overfit-sanity":
         if args.dataset_index is None:
             return [dataset_root / "splits" / "synthetic_train.jsonl"]
         return [Path(args.dataset_index)]
+    if args.run_mode == "inference-only":
+        if args.reference_index is not None:
+            return [Path(args.reference_index)]
+        return [dataset_root / "splits" / args.eval_split]
     return [
         dataset_root / "splits" / args.train_split,
         dataset_root / "splits" / args.eval_split,
@@ -155,6 +187,19 @@ def _collect_remote_dataset_repo_paths(args: argparse.Namespace) -> list[Path]:
     summary_path = dataset_root / "summary.json"
     if summary_path.exists():
         repo_paths.add(summary_path)
+    if args.run_mode == "inference-only":
+        output_root = REPO_ROOT / args.local_output
+        for relative in [
+            output_root / "model",
+            output_root / "predictions" / args.inference_mode,
+            output_root / "summary.json",
+        ]:
+            if relative.is_file():
+                repo_paths.add(relative)
+            elif relative.is_dir():
+                for path in relative.rglob("*"):
+                    if path.is_file():
+                        repo_paths.add(path)
     return sorted(repo_paths)
 
 
@@ -207,11 +252,9 @@ def remote_prepare_command() -> str:
             f"pip install {MAMBA_WHEEL_URL}",
             f"pip install {CAUSAL_CONV1D_WHEEL_URL}",
             (
-                "python - <<'PY'\n"
-                "import json\n"
-                "from pathlib import Path\n"
-                f"Path({READY_MARKER!r}).write_text(json.dumps({{'ready': True}}), encoding='utf-8')\n"
-                "PY"
+                "python -c "
+                "\"import json; from pathlib import Path; "
+                f"Path({READY_MARKER!r}).write_text(json.dumps({{'ready': True}}), encoding='utf-8')\""
             ),
         ]
     )
@@ -219,6 +262,7 @@ def remote_prepare_command() -> str:
 
 def remote_train_command(args: argparse.Namespace, remote_output: str, *, reuse_workspace: bool = False) -> str:
     prefix = _base_runtime_steps() if reuse_workspace else [remote_prepare_command(), *_base_runtime_steps()]
+    max_examples, limit = resolve_dataset_caps(args)
     if args.run_mode == "overfit-sanity":
         dataset_index = args.dataset_index or f"artifacts/datasets/{args.dataset_name}/splits/synthetic_train.jsonl"
         return " && ".join(
@@ -227,19 +271,38 @@ def remote_train_command(args: argparse.Namespace, remote_output: str, *, reuse_
                 (
                     "python -m ibm650_it.cli overfit-sanity "
                     f"--dataset-index {dataset_index} "
-                    f"--output {remote_output} "
-                    f"--example-count {args.example_count} "
-                    f"--backend {args.backend} "
-                    f"--model-name {args.model_name} "
-                    f"--qlora-bits {args.qlora_bits} "
+                f"--output {remote_output} "
+                f"--example-count {args.example_count} "
+                f"--backend {args.backend} "
+                f"--model-name {args.model_name} "
+                f"--qlora-bits {args.qlora_bits} "
                     f"--learning-rate {args.learning_rate} "
                     f"--epochs {args.epochs} "
                     f"--max-seq-length {args.max_seq_length} "
                     f"--per-device-train-batch-size {args.per_device_train_batch_size} "
-                    f"--gradient-accumulation-steps {args.gradient_accumulation_steps} "
-                    f"--max-new-tokens {args.max_new_tokens} "
-                    "--eval-mode skip "
-                    f"--failure-archive-limit {args.failure_archive_limit} "
+                f"--gradient-accumulation-steps {args.gradient_accumulation_steps} "
+                f"--max-new-tokens {args.max_new_tokens} "
+                "--eval-mode skip "
+                f"--failure-archive-limit {args.failure_archive_limit} "
+                f"--timeout-seconds {args.timeout_seconds}"
+            ).strip(),
+        ]
+    )
+    if args.run_mode == "inference-only":
+        reference_index = args.reference_index or f"artifacts/datasets/{args.dataset_name}/splits/{args.eval_split}"
+        model_path = args.model_path or f"{remote_output}/model"
+        return " && ".join(
+            [
+                *prefix,
+                (
+                    "python -m ibm650_it.cli run-inference "
+                    f"--reference-index {reference_index} "
+                    f"--output {remote_output}/predictions/{args.inference_mode} "
+                    f"--mode {args.inference_mode} "
+                    f"--model {model_path} "
+                    + (f"--limit {limit} " if limit is not None else "")
+                    + f"--max-new-tokens {args.max_new_tokens} "
+                    + "--eval-mode skip "
                     f"--timeout-seconds {args.timeout_seconds}"
                 ).strip(),
             ]
@@ -260,8 +323,8 @@ def remote_train_command(args: argparse.Namespace, remote_output: str, *, reuse_
                 f"--per-device-train-batch-size {args.per_device_train_batch_size} "
                 f"--gradient-accumulation-steps {args.gradient_accumulation_steps} "
                 f"--few-shot-k {args.few_shot_k} "
-                + (f"--limit {args.limit} " if args.limit is not None else "")
-                + (f"--max-examples {args.max_examples} " if args.max_examples is not None else "")
+                + (f"--limit {limit} " if limit is not None else "")
+                + (f"--max-examples {max_examples} " if max_examples is not None else "")
                 + f"--max-new-tokens {args.max_new_tokens} "
                 + "--eval-mode skip "
                 + f"--failure-archive-limit {args.failure_archive_limit} "
@@ -271,21 +334,32 @@ def remote_train_command(args: argparse.Namespace, remote_output: str, *, reuse_
     )
 
 
+def _sync_remote_output(ctl: RunpodCtl, ssh_info: dict[str, object], remote_output_path: str, local_output_root: Path) -> None:
+    with tempfile.TemporaryDirectory() as tempdir:
+        temp_root = Path(tempdir)
+        ctl.scp_from(ssh_info, remote_output_path, temp_root)
+        downloaded_root = temp_root / Path(remote_output_path).name
+        if not downloaded_root.exists():
+            raise FileNotFoundError(f"downloaded output missing: {downloaded_root}")
+        shutil.copytree(downloaded_root, local_output_root, dirs_exist_ok=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", default="ibmotron-runpod-train")
     parser.add_argument("--pod-id")
-    parser.add_argument("--run-mode", choices=["train-eval", "overfit-sanity"], default="train-eval")
+    parser.add_argument("--run-mode", choices=["train-eval", "overfit-sanity", "inference-only"], default="train-eval")
     parser.add_argument("--gpu-id", default="NVIDIA RTX A6000")
     parser.add_argument("--cloud-type", default="COMMUNITY")
     parser.add_argument("--image", default="runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404")
     parser.add_argument("--dataset-name", default="pilot_1000")
     parser.add_argument("--dataset-index")
+    parser.add_argument("--reference-index")
     parser.add_argument("--backend", default="transformers_qlora")
     parser.add_argument("--model-name", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
-    parser.add_argument("--qlora-bits", type=int, default=4)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--qlora-bits", type=int, default=REAL_BASELINE_QLORA_BITS)
+    parser.add_argument("--learning-rate", type=float, default=REAL_BASELINE_LEARNING_RATE)
+    parser.add_argument("--epochs", type=int, default=REAL_BASELINE_EPOCHS)
     parser.add_argument("--max-seq-length", type=int, default=4096)
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
@@ -293,8 +367,10 @@ def main() -> None:
     parser.add_argument("--train-split", default="synthetic_train.jsonl")
     parser.add_argument("--eval-split", default="synthetic_dev.jsonl")
     parser.add_argument("--limit", type=int)
-    parser.add_argument("--max-examples", type=int, default=128)
-    parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--max-examples", type=int)
+    parser.add_argument("--inference-mode", choices=["zero_shot", "few_shot", "fine_tuned"], default="fine_tuned")
+    parser.add_argument("--model-path")
+    parser.add_argument("--max-new-tokens", type=int, default=REAL_BASELINE_MAX_NEW_TOKENS)
     parser.add_argument("--failure-archive-limit", type=int, default=25)
     parser.add_argument("--step-budget", default="50M")
     parser.add_argument("--timeout-seconds", type=int, default=30)
@@ -374,13 +450,23 @@ def main() -> None:
             }
             print(json.dumps(summary, indent=2))
             raise SystemExit(proc.returncode or 1)
-        ctl.scp_from(ssh_info, remote_output_path, REPO_ROOT / args.local_output)
-        subprocess.run(["./scripts/build_simh.sh"], cwd=REPO_ROOT, check=True)
         local_output_root = REPO_ROOT / args.local_output
+        _sync_remote_output(ctl, ssh_info, remote_output_path, local_output_root)
+        subprocess.run(["./scripts/build_simh.sh"], cwd=REPO_ROOT, check=True)
         if args.run_mode == "overfit-sanity":
             finalize_overfit_output(
                 dataset_index=REPO_ROOT / args.dataset_index,
                 output_root=local_output_root,
+                failure_archive_limit=args.failure_archive_limit,
+                repo_root=REPO_ROOT,
+                step_budget=args.step_budget,
+                timeout_seconds=args.timeout_seconds,
+            )
+        elif args.run_mode == "inference-only":
+            finalize_train_eval_output(
+                dataset_root=REPO_ROOT / f"artifacts/datasets/{args.dataset_name}",
+                output_root=local_output_root,
+                eval_split=args.eval_split,
                 failure_archive_limit=args.failure_archive_limit,
                 repo_root=REPO_ROOT,
                 step_budget=args.step_budget,

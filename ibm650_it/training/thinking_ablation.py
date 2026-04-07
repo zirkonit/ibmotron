@@ -6,6 +6,7 @@ from typing import Any
 
 from ibm650_it import REPO_ROOT
 from ibm650_it.eval.finalize import reevaluate_and_report_mode
+from ibm650_it.eval.locking import finalize_session
 from ibm650_it.training.infer import run_inference
 
 
@@ -135,36 +136,38 @@ def finalize_thinking_ablation_output(
     timeout_seconds: int = 30,
 ) -> dict[str, Any]:
     output_root.mkdir(parents=True, exist_ok=True)
-    existing_summary_path = output_root / "summary.json"
-    existing_summary = json.loads(existing_summary_path.read_text(encoding="utf-8")) if existing_summary_path.exists() else {}
-    conditions: dict[str, Any] = existing_summary.get("conditions", {})
-    reports: dict[str, dict[str, Any]] = {}
+    with finalize_session(output_root, scope="thinking_ablation") as session:
+        existing_summary_path = output_root / "summary.json"
+        existing_summary = json.loads(existing_summary_path.read_text(encoding="utf-8")) if existing_summary_path.exists() else {}
+        conditions: dict[str, Any] = existing_summary.get("conditions", {})
+        reports: dict[str, dict[str, Any]] = {}
 
-    for name in ["thinking_on", "thinking_off"]:
-        mode_output = output_root / "predictions" / name
-        mode_result = reevaluate_and_report_mode(
+        for name in ["thinking_on", "thinking_off"]:
+            session.write_state(status="running", current_mode=name)
+            mode_output = output_root / "predictions" / name
+            mode_result = reevaluate_and_report_mode(
+                reference_index=reference_index,
+                prediction_index=mode_output / "predictions.jsonl",
+                prediction_output_dir=mode_output,
+                report_path=output_root / "reports" / f"{name}.json",
+                failure_output_dir=output_root / "failures" / name,
+                failure_archive_limit=failure_archive_limit,
+                repo_root=repo_root,
+                step_budget=step_budget,
+                timeout_seconds=timeout_seconds,
+            )
+            conditions[name] = {
+                **conditions.get(name, {}),
+                **mode_result,
+            }
+            reports[name] = mode_result["report"]
+
+        summary = _build_summary(
+            model_dir=model_dir,
             reference_index=reference_index,
-            prediction_index=mode_output / "predictions.jsonl",
-            prediction_output_dir=mode_output,
-            report_path=output_root / "reports" / f"{name}.json",
-            failure_output_dir=output_root / "failures" / name,
-            failure_archive_limit=failure_archive_limit,
-            repo_root=repo_root,
-            step_budget=step_budget,
-            timeout_seconds=timeout_seconds,
+            eval_mode="local_cpu_reevaluate",
+            conditions=conditions,
+            reports=reports,
         )
-        conditions[name] = {
-            **conditions.get(name, {}),
-            **mode_result,
-        }
-        reports[name] = mode_result["report"]
-
-    summary = _build_summary(
-        model_dir=model_dir,
-        reference_index=reference_index,
-        eval_mode="local_cpu_reevaluate",
-        conditions=conditions,
-        reports=reports,
-    )
-    existing_summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    return summary
+        existing_summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        return summary

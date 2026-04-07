@@ -42,9 +42,9 @@ def test_derive_phase_uses_remote_progress() -> None:
         },
     }
 
-    phase = dashboard._derive_phase(job, remote)
+    phase = dashboard._derive_phase(job, remote, None)
 
-    assert phase == "fine_tuned"
+    assert phase == "remote_generate"
 
 
 def test_derive_phase_handles_reused_workspace_without_tgz() -> None:
@@ -61,9 +61,9 @@ def test_derive_phase_handles_reused_workspace_without_tgz() -> None:
         },
     }
 
-    phase = dashboard._derive_phase(job, remote)
+    phase = dashboard._derive_phase(job, remote, None)
 
-    assert phase == "fine_tuned"
+    assert phase == "remote_generate"
 
 
 def test_match_pod_prefers_explicit_pod_id() -> None:
@@ -102,6 +102,43 @@ def test_collect_recent_runs_reads_top_level_summaries(tmp_path: Path, monkeypat
     assert runs[0]["path"] == "artifacts/eval_reports/run_one"
     assert runs[0]["eval_mode"] == "local_cpu_reevaluate"
     assert runs[0]["train"]["backend"] == "transformers_qlora"
+
+
+def test_collect_recent_runs_reads_nested_sweep_summaries(tmp_path: Path, monkeypatch) -> None:
+    eval_root = tmp_path / "artifacts" / "eval_reports" / "sweeps" / "example" / "e5_lr0p0002"
+    eval_root.mkdir(parents=True)
+    (eval_root / "summary.json").write_text(
+        json.dumps(
+            {
+                "eval_mode": "local_cpu_reevaluate",
+                "train": {"backend": "transformers_qlora", "qlora_bits": 0},
+                "evaluations": {"fine_tuned": {"report": {"exact_match": 0.4, "assemblability": 1.0, "functional_equivalence": 0.6}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dashboard, "REPO_ROOT", tmp_path)
+
+    runs = dashboard.collect_recent_runs(limit=5)
+
+    assert len(runs) == 1
+    assert runs[0]["path"] == "artifacts/eval_reports/sweeps/example/e5_lr0p0002"
+
+
+def test_inspect_local_output_reports_local_reevaluate_when_finalize_state_exists(tmp_path: Path, monkeypatch) -> None:
+    output_root = tmp_path / "artifacts" / "eval_reports" / "run_one"
+    output_root.mkdir(parents=True)
+    (output_root / ".finalize_state.json").write_text(
+        json.dumps({"status": "running", "current_mode": "fine_tuned"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dashboard, "REPO_ROOT", tmp_path)
+
+    local = dashboard._inspect_local_output("artifacts/eval_reports/run_one", "train-eval")
+
+    assert local is not None
+    assert local["phase"] == "local_reevaluate"
+    assert local["state"]["current_mode"] == "fine_tuned"
 
 
 def test_collect_dashboard_status_matches_warm_pod_by_id(monkeypatch) -> None:
@@ -159,5 +196,6 @@ def test_collect_dashboard_status_matches_warm_pod_by_id(monkeypatch) -> None:
     assert len(status["active_jobs"]) == 1
     job = status["active_jobs"][0]
     assert job["pod_id"] == "warm-pod-123"
-    assert job["phase"] == "fine_tuned"
+    assert job["phase"] == "remote_generate"
+    assert job["remote"]["phase"] == "fine_tuned"
     assert status["orphan_pods"] == []

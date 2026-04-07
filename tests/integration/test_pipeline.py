@@ -77,7 +77,7 @@ def test_stage_pipeline_matches_shipped_example1_output(tmp_path: Path) -> None:
     assert read_deck_cards(pipeline.run.output_deck) == read_deck_cards(Path(baseline["output_deck"]))  # type: ignore[arg-type]
 
 
-def test_generate_accepted_b0_and_b1(tmp_path: Path) -> None:
+def test_generate_accepted_bands_b0_through_b3(tmp_path: Path) -> None:
     runner = SimhRunner(repo_root=REPO_ROOT)
     b0 = generate_accepted_programs(
         runner=runner,
@@ -93,10 +93,28 @@ def test_generate_accepted_b0_and_b1(tmp_path: Path) -> None:
         output_dir=tmp_path / "b1",
         start_seed=100,
     )
+    b2 = generate_accepted_programs(
+        runner=runner,
+        band="B2",
+        count=1,
+        output_dir=tmp_path / "b2",
+        start_seed=200,
+    )
+    b3 = generate_accepted_programs(
+        runner=runner,
+        band="B3",
+        count=1,
+        output_dir=tmp_path / "b3",
+        start_seed=300,
+    )
     assert b0["accepted"] == 1
     assert b1["accepted"] == 1
+    assert b2["accepted"] == 1
+    assert b3["accepted"] == 1
     assert Path(b0["index_path"]).exists()
     assert Path(b1["index_path"]).exists()
+    assert Path(b2["index_path"]).exists()
+    assert Path(b3["index_path"]).exists()
 
 
 def test_build_small_pilot_corpus(tmp_path: Path) -> None:
@@ -327,3 +345,51 @@ def test_local_reevaluation_flags_tail_truncation_as_misexecution(tmp_path: Path
     assert reevaluated_record["metrics"]["exact_match"] is False
     assert reevaluated_record["assemblable"] is True
     assert reevaluated_record["failure_type"] == "assembles_but_misexecutes"
+
+
+def test_local_reevaluation_is_deterministic_across_repeated_runs(tmp_path: Path) -> None:
+    pilot = build_pilot_corpus(
+        repo_root=REPO_ROOT,
+        output_root=tmp_path / "pilot",
+        band_counts={"B0": 2, "B1": 2},
+        workers=2,
+        include_historical_golden=False,
+    )
+    index_path = Path(pilot["index_path"])
+    sft_path = tmp_path / "training" / "train.jsonl"
+    prepare_sft_examples(dataset_index=index_path, output_path=sft_path)
+    train_model(
+        sft_path=sft_path,
+        output_dir=tmp_path / "training" / "model",
+        config=TrainConfig(backend="smoke"),
+    )
+    inference = run_inference(
+        reference_index=index_path,
+        output_dir=tmp_path / "eval" / "fine",
+        mode="fine_tuned",
+        model_dir=tmp_path / "training" / "model",
+        limit=1,
+        eval_mode="skip",
+    )
+    prediction_index = Path(inference["prediction_index"])
+
+    first = reevaluate_prediction_records(
+        reference_index=index_path,
+        prediction_index=prediction_index,
+        output_dir=tmp_path / "eval" / "fine",
+    )
+    second = reevaluate_prediction_records(
+        reference_index=index_path,
+        prediction_index=Path(first["prediction_index"]),
+        output_dir=tmp_path / "eval" / "fine",
+    )
+    first_report = build_evaluation_report(
+        reference_index=index_path,
+        prediction_index=Path(first["prediction_index"]),
+    )
+    second_report = build_evaluation_report(
+        reference_index=index_path,
+        prediction_index=Path(second["prediction_index"]),
+    )
+
+    assert first_report == second_report

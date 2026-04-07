@@ -14,7 +14,8 @@ from ibm650_it.dataset.build_records import build_record
 from ibm650_it.dataset.dedupe import dedupe_by_hash
 from ibm650_it.dataset.io import load_jsonl, relativize_record_paths, write_jsonl
 from ibm650_it.dataset.provenance import build_provenance
-from ibm650_it.dataset.split import split_by_alpha_hash
+from ibm650_it.dataset.split import build_exact_splits, split_by_alpha_hash
+from ibm650_it.dataset.stages import stage_band_counts, stage_split_counts
 from ibm650_it.generate.sample_program import generate_band_program, infer_features
 from ibm650_it.simh.runner import SimhRunner
 from ibm650_it.source.render_it_card80 import render_simh_source_deck
@@ -111,8 +112,13 @@ def build_splits(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]
     return buckets
 
 
-def write_split_outputs(records: list[dict[str, Any]], output_root: Path) -> dict[str, str]:
-    buckets = build_splits(records)
+def write_split_outputs(
+    records: list[dict[str, Any]],
+    output_root: Path,
+    *,
+    split_counts: dict[str, int] | None = None,
+) -> dict[str, str]:
+    buckets = build_exact_splits(records, split_counts=split_counts) if split_counts is not None else build_splits(records)
     outputs: dict[str, str] = {}
     for split_name, split_records in buckets.items():
         path = output_root / "splits" / f"{split_name}.jsonl"
@@ -171,6 +177,7 @@ def build_pilot_corpus(
     max_attempts_per_band: int | None = None,
     include_historical_golden: bool = True,
     resume: bool = False,
+    split_counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     output_root.mkdir(parents=True, exist_ok=True)
     provenance = build_provenance(repo_root)
@@ -275,7 +282,7 @@ def build_pilot_corpus(
             accepted.extend(add_historical_golden_records(repo_root=repo_root, output_root=output_root))
 
     index_path = write_jsonl(output_root / "index.jsonl", accepted)
-    split_outputs = write_split_outputs(accepted, output_root)
+    split_outputs = write_split_outputs(accepted, output_root, split_counts=split_counts)
     rejected_path = write_jsonl(output_root / "rejections.jsonl", rejections)
     summary = {
         "accepted_total": len(accepted),
@@ -284,6 +291,7 @@ def build_pilot_corpus(
         "rejection_counts": dict(rejection_counts),
         "dedupe_removed": dedupe_removed,
         "target_band_counts": band_counts,
+        "target_split_counts": split_counts or {},
         "provenance": provenance,
         "index_path": str(index_path),
         "rejected_path": str(rejected_path),
@@ -293,4 +301,30 @@ def build_pilot_corpus(
     missing = {band: target - accepted_counts[band] for band, target in band_counts.items() if accepted_counts[band] < target}
     if missing:
         raise RuntimeError(f"pilot corpus did not reach requested counts: {missing}")
+    return summary
+
+
+def build_stage_corpus(
+    *,
+    stage: str,
+    repo_root: Path = REPO_ROOT,
+    output_root: Path,
+    workers: int = 4,
+    max_attempts_per_band: int | None = None,
+    include_historical_golden: bool = False,
+    resume: bool = False,
+) -> dict[str, Any]:
+    output_root.mkdir(parents=True, exist_ok=True)
+    summary = build_pilot_corpus(
+        repo_root=repo_root,
+        output_root=output_root,
+        band_counts=stage_band_counts(stage),
+        workers=workers,
+        max_attempts_per_band=max_attempts_per_band,
+        include_historical_golden=include_historical_golden,
+        resume=resume,
+        split_counts=stage_split_counts(stage),
+    )
+    summary["stage"] = stage
+    (output_root / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
