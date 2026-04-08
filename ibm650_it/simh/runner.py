@@ -99,12 +99,12 @@ class SimhRunner:
         simh_root: Path | None = None,
         simh_binary: Path | None = None,
     ) -> None:
-        self.repo_root = repo_root
-        self.simh_root = simh_root or repo_root / "third_party/simh"
-        self.simh_binary = simh_binary or self.simh_root / "BIN/i650"
+        self.repo_root = repo_root.resolve()
+        self.simh_root = simh_root.resolve() if simh_root is not None else self.repo_root / "third_party/simh"
+        self.simh_binary = simh_binary.resolve() if simh_binary is not None else self.simh_root / "BIN/i650"
         self.sw_root = self.simh_root / "I650/sw"
         self.it_root = self.sw_root / "it"
-        self.template_root = repo_root / "ibm650_it/simh/ini_templates"
+        self.template_root = self.repo_root / "ibm650_it/simh/ini_templates"
 
     def _check_prereqs(self) -> None:
         if not self.simh_binary.exists():

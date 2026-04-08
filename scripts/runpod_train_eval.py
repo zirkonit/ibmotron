@@ -3,12 +3,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
+from datetime import datetime
 from pathlib import Path
+import shlex
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -33,6 +37,11 @@ CAUSAL_CONV1D_WHEEL_URL = (
 )
 READY_MARKER = "/workspace/ibmotron/.ibmotron_ready.json"
 ARCHIVE_CACHE_DIR = REPO_ROOT / "artifacts" / "cache" / "runpod_archives"
+LOCAL_JOB_METADATA_FILENAME = ".runpod_job.json"
+REMOTE_JOB_SCRIPT_FILENAME = ".runpod_remote_job.sh"
+REMOTE_JOB_STATE_FILENAME = ".runpod_remote_state.json"
+REMOTE_JOB_LOG_FILENAME = ".runpod_remote.log"
+COLLECT_WATCHER_LOG_FILENAME = ".runpod_collect_watcher.log"
 REAL_BASELINE_QLORA_BITS = 0
 REAL_BASELINE_LEARNING_RATE = 2e-4
 REAL_BASELINE_EPOCHS = 5
@@ -188,6 +197,14 @@ def _collect_remote_dataset_repo_paths(args: argparse.Namespace) -> list[Path]:
     if summary_path.exists():
         repo_paths.add(summary_path)
     if args.run_mode == "inference-only":
+        if args.model_path is not None:
+            model_root = (REPO_ROOT / args.model_path).resolve()
+            if model_root.is_file():
+                repo_paths.add(REPO_ROOT / _repo_relative(model_root))
+            elif model_root.is_dir():
+                for path in model_root.rglob("*"):
+                    if path.is_file():
+                        repo_paths.add(path)
         output_root = REPO_ROOT / args.local_output
         for relative in [
             output_root / "model",
@@ -220,6 +237,13 @@ def _base_runtime_steps() -> list[str]:
         "export HF_HOME=/workspace/.cache/huggingface",
         "mkdir -p \"$HF_HOME\"",
     ]
+
+
+def _band_repeat_flags(args: argparse.Namespace) -> str:
+    flags: list[str] = []
+    for value in getattr(args, "band_repeat", []) or []:
+        flags.append(f"--band-repeat {value}")
+    return " ".join(flags)
 
 
 def remote_prepare_command() -> str:
@@ -263,6 +287,7 @@ def remote_prepare_command() -> str:
 def remote_train_command(args: argparse.Namespace, remote_output: str, *, reuse_workspace: bool = False) -> str:
     prefix = _base_runtime_steps() if reuse_workspace else [remote_prepare_command(), *_base_runtime_steps()]
     max_examples, limit = resolve_dataset_caps(args)
+    band_repeat_flags = _band_repeat_flags(args)
     if args.run_mode == "overfit-sanity":
         dataset_index = args.dataset_index or f"artifacts/datasets/{args.dataset_name}/splits/synthetic_train.jsonl"
         return " && ".join(
@@ -271,23 +296,24 @@ def remote_train_command(args: argparse.Namespace, remote_output: str, *, reuse_
                 (
                     "python -m ibm650_it.cli overfit-sanity "
                     f"--dataset-index {dataset_index} "
-                f"--output {remote_output} "
-                f"--example-count {args.example_count} "
-                f"--backend {args.backend} "
-                f"--model-name {args.model_name} "
-                f"--qlora-bits {args.qlora_bits} "
+                    f"--output {remote_output} "
+                    f"--example-count {args.example_count} "
+                    f"--backend {args.backend} "
+                    f"--model-name {args.model_name} "
+                    f"--qlora-bits {args.qlora_bits} "
                     f"--learning-rate {args.learning_rate} "
                     f"--epochs {args.epochs} "
                     f"--max-seq-length {args.max_seq_length} "
                     f"--per-device-train-batch-size {args.per_device_train_batch_size} "
-                f"--gradient-accumulation-steps {args.gradient_accumulation_steps} "
-                f"--max-new-tokens {args.max_new_tokens} "
-                "--eval-mode skip "
-                f"--failure-archive-limit {args.failure_archive_limit} "
-                f"--timeout-seconds {args.timeout_seconds}"
-            ).strip(),
-        ]
-    )
+                    f"--gradient-accumulation-steps {args.gradient_accumulation_steps} "
+                    + (f"{band_repeat_flags} " if band_repeat_flags else "")
+                    + f"--max-new-tokens {args.max_new_tokens} "
+                    + "--eval-mode skip "
+                    + f"--failure-archive-limit {args.failure_archive_limit} "
+                    + f"--timeout-seconds {args.timeout_seconds}"
+                ).strip(),
+            ]
+        )
     if args.run_mode == "inference-only":
         reference_index = args.reference_index or f"artifacts/datasets/{args.dataset_name}/splits/{args.eval_split}"
         model_path = args.model_path or f"{remote_output}/model"
@@ -323,12 +349,13 @@ def remote_train_command(args: argparse.Namespace, remote_output: str, *, reuse_
                 f"--per-device-train-batch-size {args.per_device_train_batch_size} "
                 f"--gradient-accumulation-steps {args.gradient_accumulation_steps} "
                 f"--few-shot-k {args.few_shot_k} "
+                + (f"{band_repeat_flags} " if band_repeat_flags else "")
                 + (f"--limit {limit} " if limit is not None else "")
                 + (f"--max-examples {max_examples} " if max_examples is not None else "")
                 + f"--max-new-tokens {args.max_new_tokens} "
                 + "--eval-mode skip "
                 + f"--failure-archive-limit {args.failure_archive_limit} "
-                f"--timeout-seconds {args.timeout_seconds}"
+                + f"--timeout-seconds {args.timeout_seconds}"
             ).strip(),
         ]
     )
@@ -342,6 +369,314 @@ def _sync_remote_output(ctl: RunpodCtl, ssh_info: dict[str, object], remote_outp
         if not downloaded_root.exists():
             raise FileNotFoundError(f"downloaded output missing: {downloaded_root}")
         shutil.copytree(downloaded_root, local_output_root, dirs_exist_ok=True)
+
+
+def _metadata_path(local_output_root: Path) -> Path:
+    return local_output_root / LOCAL_JOB_METADATA_FILENAME
+
+
+def _write_job_metadata(local_output_root: Path, payload: dict[str, object]) -> Path:
+    local_output_root.mkdir(parents=True, exist_ok=True)
+    path = _metadata_path(local_output_root)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
+def _load_job_metadata(local_output_root: Path) -> dict[str, object] | None:
+    path = _metadata_path(local_output_root)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _remote_output_paths(remote_output: str) -> dict[str, str]:
+    remote_root = f"/workspace/ibmotron/{remote_output}"
+    return {
+        "root": remote_root,
+        "state": f"{remote_root}/{REMOTE_JOB_STATE_FILENAME}",
+        "log": f"{remote_root}/{REMOTE_JOB_LOG_FILENAME}",
+        "script": f"{remote_root}/{REMOTE_JOB_SCRIPT_FILENAME}",
+    }
+
+
+def _job_metadata_payload(args: argparse.Namespace, *, pod_id: str, detached: bool, status: str) -> dict[str, object]:
+    return {
+        "name": args.name,
+        "pod_id": pod_id,
+        "run_mode": args.run_mode,
+        "dataset_name": args.dataset_name,
+        "dataset_index": args.dataset_index,
+        "reference_index": args.reference_index,
+        "eval_split": args.eval_split,
+        "inference_mode": args.inference_mode,
+        "remote_output": args.remote_output,
+        "local_output": args.local_output,
+        "band_repeat": list(getattr(args, "band_repeat", []) or []),
+        "max_examples": args.max_examples,
+        "limit": args.limit,
+        "detached": detached,
+        "status": status,
+        "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+
+
+def _watcher_log_path(local_output_root: Path) -> Path:
+    return local_output_root / COLLECT_WATCHER_LOG_FILENAME
+
+
+def _spawn_collect_watcher(args: argparse.Namespace, local_output_root: Path) -> int:
+    local_output_root.mkdir(parents=True, exist_ok=True)
+    log_path = _watcher_log_path(local_output_root)
+    with log_path.open("ab") as log_handle:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--watch-collect",
+                "--local-output",
+                args.local_output,
+                "--auto-collect-poll-seconds",
+                str(args.auto_collect_poll_seconds),
+            ],
+            cwd=REPO_ROOT,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    return proc.pid
+
+
+def _build_remote_job_script(args: argparse.Namespace, remote_command: str) -> str:
+    remote_paths = _remote_output_paths(args.remote_output)
+    state_path = remote_paths["state"]
+    output_root = remote_paths["root"]
+    running_writer = (
+        "import json; "
+        "from datetime import datetime; "
+        "from pathlib import Path; "
+        f"path = Path({state_path!r}); "
+        "path.write_text(json.dumps({"
+        f"'status': 'running', 'run_mode': {args.run_mode!r}, 'name': {args.name!r}, "
+        "'updated_at': datetime.now().astimezone().isoformat(timespec='seconds')"
+        "}, indent=2), encoding='utf-8')"
+    )
+    complete_writer = (
+        "import json, os; "
+        "from datetime import datetime; "
+        "from pathlib import Path; "
+        f"path = Path({state_path!r}); "
+        "status = int(os.environ.get('IBMOTRON_JOB_STATUS', '0')); "
+        "path.write_text(json.dumps({"
+        "'status': 'complete' if status == 0 else 'failed', "
+        f"'run_mode': {args.run_mode!r}, 'name': {args.name!r}, "
+        "'exit_code': status, "
+        "'updated_at': datetime.now().astimezone().isoformat(timespec='seconds')"
+        "}, indent=2), encoding='utf-8')"
+    )
+    return "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set +e",
+            f"mkdir -p {shlex.quote(output_root)}",
+            "python3 -c " + shlex.quote(running_writer),
+            f"bash -lc {shlex.quote(remote_command)}",
+            "status=$?",
+            'export IBMOTRON_JOB_STATUS="$status"',
+            "python3 -c " + shlex.quote(complete_writer),
+            "exit \"$status\"",
+        ]
+    )
+
+
+def _launch_detached_remote_job(
+    ctl: RunpodCtl,
+    ssh_info: dict[str, object],
+    *,
+    args: argparse.Namespace,
+    remote_command: str,
+) -> dict[str, object]:
+    remote_paths = _remote_output_paths(args.remote_output)
+    script_text = _build_remote_job_script(args, remote_command)
+    write_script_command = " && ".join(
+        [
+            f"mkdir -p {shlex.quote(remote_paths['root'])}",
+            "python3 -c "
+            + shlex.quote(
+                (
+                    "from pathlib import Path; "
+                    f"Path({remote_paths['script']!r}).write_text({script_text!r}, encoding='utf-8')"
+                )
+            ),
+            f"chmod +x {shlex.quote(remote_paths['script'])}",
+            (
+                f"nohup bash {shlex.quote(remote_paths['script'])} "
+                f"> {shlex.quote(remote_paths['log'])} 2>&1 < /dev/null & echo $!"
+            ),
+        ]
+    )
+    proc = ctl.ssh(ssh_info, write_script_command, check=False)
+    job_pid = (proc.stdout or "").strip().splitlines()[-1] if (proc.stdout or "").strip() else ""
+    return {
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "remote_pid": job_pid,
+        "remote_paths": remote_paths,
+    }
+
+
+def _remote_job_status(ctl: RunpodCtl, ssh_info: dict[str, object], *, remote_output: str) -> dict[str, object]:
+    remote_paths = _remote_output_paths(remote_output)
+    remote_script = f"""
+import json
+import subprocess
+from pathlib import Path
+
+state_path = Path({remote_paths["state"]!r})
+root = Path({remote_paths["root"]!r})
+payload = {{
+    "state_exists": state_path.exists(),
+    "output_exists": root.exists(),
+}}
+if state_path.exists():
+    try:
+        payload["state"] = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        payload["state_error"] = str(exc)
+ps_text = subprocess.run(
+    ["bash", "-lc", "ps -eo pid,command | egrep 'python -m ibm650_it.cli (train-eval|overfit-sanity|run-inference)' | grep -v grep || true"],
+    text=True,
+    capture_output=True,
+    check=False,
+).stdout.strip()
+payload["active_process"] = bool(ps_text)
+payload["process"] = ps_text
+print(json.dumps(payload))
+"""
+    proc = ctl.ssh(ssh_info, f"python3 - <<'PY'\n{remote_script}\nPY", check=False)
+    if proc.returncode != 0:
+        return {"error": proc.stderr.strip() or proc.stdout.strip() or f"ssh failed: {proc.returncode}"}
+    return json.loads(proc.stdout)
+
+
+def _finalize_local_output(args: argparse.Namespace, local_output_root: Path) -> dict[str, object]:
+    subprocess.run(["./scripts/build_simh.sh"], cwd=REPO_ROOT, check=True)
+    if args.run_mode == "overfit-sanity":
+        return finalize_overfit_output(
+            dataset_index=REPO_ROOT / args.dataset_index,
+            output_root=local_output_root,
+            failure_archive_limit=args.failure_archive_limit,
+            repo_root=REPO_ROOT,
+            step_budget=args.step_budget,
+            timeout_seconds=args.timeout_seconds,
+        )
+    return finalize_train_eval_output(
+        dataset_root=REPO_ROOT / f"artifacts/datasets/{args.dataset_name}",
+        output_root=local_output_root,
+        eval_split=args.eval_split,
+        failure_archive_limit=args.failure_archive_limit,
+        repo_root=REPO_ROOT,
+        step_budget=args.step_budget,
+        timeout_seconds=args.timeout_seconds,
+    )
+
+
+def _hydrate_args_from_metadata(args: argparse.Namespace, *, force: bool = False) -> None:
+    local_output_root = REPO_ROOT / args.local_output
+    metadata = _load_job_metadata(local_output_root)
+    if metadata is None:
+        return
+    for field in [
+        "pod_id",
+        "run_mode",
+        "dataset_name",
+        "dataset_index",
+        "reference_index",
+        "eval_split",
+        "inference_mode",
+        "remote_output",
+        "band_repeat",
+    ]:
+        if force or getattr(args, field, None) in (None, False):
+            value = metadata.get(field)
+            if value not in (None, ""):
+                setattr(args, field, value)
+
+
+def _run_collect_watcher(args: argparse.Namespace) -> int:
+    _hydrate_args_from_metadata(args, force=True)
+    local_output_root = REPO_ROOT / args.local_output
+    while True:
+        metadata = _load_job_metadata(local_output_root) or {}
+        if (local_output_root / "summary.json").exists():
+            metadata["status"] = "complete"
+            metadata["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+            _write_job_metadata(local_output_root, metadata)
+            return 0
+        try:
+            ctl = RunpodCtl(repo_root=REPO_ROOT)
+            pod_id = str(metadata.get("pod_id") or args.pod_id or "")
+            if not pod_id:
+                print("watch-collect: missing pod_id in metadata", file=sys.stderr)
+                return 2
+            ssh_info = ctl.wait_for_ssh(pod_id, timeout_seconds=60, poll_seconds=5)
+            remote_status = _remote_job_status(ctl, ssh_info, remote_output=str(metadata.get("remote_output") or args.remote_output))
+            if remote_status.get("error"):
+                print(f"watch-collect: remote status error: {remote_status['error']}", flush=True)
+                time.sleep(args.auto_collect_poll_seconds)
+                continue
+            state = remote_status.get("state") or {}
+            if remote_status.get("active_process") or state.get("status") not in {"complete", "failed"}:
+                print(
+                    json.dumps(
+                        {
+                            "watch": "waiting",
+                            "pod_id": pod_id,
+                            "state": state,
+                            "active_process": remote_status.get("active_process"),
+                            "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        }
+                    ),
+                    flush=True,
+                )
+                time.sleep(args.auto_collect_poll_seconds)
+                continue
+            print(
+                json.dumps(
+                    {
+                        "watch": "collecting",
+                        "pod_id": pod_id,
+                        "state": state,
+                        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    }
+                ),
+                flush=True,
+            )
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--collect-only",
+                    "--local-output",
+                    args.local_output,
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            sys.stdout.write(proc.stdout)
+            sys.stderr.write(proc.stderr)
+            if proc.returncode == 0:
+                metadata = _load_job_metadata(local_output_root) or metadata
+                metadata["status"] = "complete"
+                metadata["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+                _write_job_metadata(local_output_root, metadata)
+                return 0
+            print(f"watch-collect: collect-only failed with rc={proc.returncode}", flush=True)
+        except Exception as exc:
+            print(f"watch-collect: exception: {exc}", flush=True)
+        time.sleep(args.auto_collect_poll_seconds)
 
 
 def main() -> None:
@@ -364,6 +699,7 @@ def main() -> None:
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--few-shot-k", type=int, default=4)
+    parser.add_argument("--band-repeat", action="append", default=[])
     parser.add_argument("--train-split", default="synthetic_train.jsonl")
     parser.add_argument("--eval-split", default="synthetic_dev.jsonl")
     parser.add_argument("--limit", type=int)
@@ -378,32 +714,85 @@ def main() -> None:
     parser.add_argument("--local-output", default="artifacts/eval_reports/runpod_train_eval")
     parser.add_argument("--example-count", type=int, default=32)
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--detach-remote", action="store_true")
+    parser.add_argument("--collect-only", action="store_true")
     parser.add_argument("--reuse-pod-workspace", action="store_true")
     parser.add_argument("--keep-pod", action="store_true")
+    parser.add_argument("--watch-collect", action="store_true")
+    parser.add_argument("--auto-collect-poll-seconds", type=int, default=60)
     args = parser.parse_args()
+
+    if args.watch_collect:
+        raise SystemExit(_run_collect_watcher(args))
 
     if args.prepare_only and not (args.keep_pod or args.pod_id):
         raise SystemExit("--prepare-only requires --keep-pod or --pod-id so the prepared pod is retained")
+    if args.prepare_only and (args.detach_remote or args.collect_only):
+        raise SystemExit("--prepare-only cannot be combined with --detach-remote or --collect-only")
+    if args.detach_remote and args.collect_only:
+        raise SystemExit("--detach-remote and --collect-only are mutually exclusive")
     if args.reuse_pod_workspace and not args.pod_id:
         raise SystemExit("--reuse-pod-workspace requires --pod-id")
+    if args.collect_only:
+        _hydrate_args_from_metadata(args, force=True)
+        if not args.pod_id:
+            raise SystemExit("--collect-only requires --pod-id or a local metadata file with pod_id")
 
     ctl = RunpodCtl(repo_root=REPO_ROOT)
     ctl.ensure_ssh_key()
 
-    pod = (
-        ctl.get_pod(args.pod_id)
-        if args.pod_id
-        else ctl.create_pod(
-            name=args.name,
-            gpu_id=args.gpu_id,
-            image=args.image,
-            cloud_type=args.cloud_type,
-            public_ip=args.cloud_type.upper() == "COMMUNITY",
+    pod = None
+    if not args.collect_only:
+        pod = (
+            ctl.get_pod(args.pod_id)
+            if args.pod_id
+            else ctl.create_pod(
+                name=args.name,
+                gpu_id=args.gpu_id,
+                image=args.image,
+                cloud_type=args.cloud_type,
+                public_ip=args.cloud_type.upper() == "COMMUNITY",
+            )
         )
-    )
+    else:
+        pod = ctl.get_pod(args.pod_id)
     pod_id = pod["id"]
+    delete_pod_on_exit = False
     try:
         ssh_info = ctl.wait_for_ssh(pod_id, timeout_seconds=600, poll_seconds=10)
+        local_output_root = REPO_ROOT / args.local_output
+        if args.collect_only:
+            remote_status = _remote_job_status(ctl, ssh_info, remote_output=args.remote_output)
+            state = remote_status.get("state") if isinstance(remote_status, dict) else None
+            if remote_status.get("error"):
+                raise SystemExit(remote_status["error"])
+            if remote_status.get("active_process"):
+                raise SystemExit(f"remote job on pod {pod_id} is still running; collect later")
+            if state is not None and state.get("status") not in {"complete", "failed"}:
+                raise SystemExit(f"remote job state is not terminal: {state}")
+            remote_output_path = f"/workspace/ibmotron/{args.remote_output}"
+            exists = ctl.ssh(ssh_info, f"test -e {remote_output_path}", check=False)
+            if exists.returncode != 0:
+                raise SystemExit(f"remote output missing: {remote_output_path}")
+            _sync_remote_output(ctl, ssh_info, remote_output_path, local_output_root)
+            finalized = _finalize_local_output(args, local_output_root)
+            metadata = _job_metadata_payload(args, pod_id=pod_id, detached=True, status="complete")
+            metadata["remote_state"] = state
+            metadata["local_summary"] = str(local_output_root / "summary.json")
+            _write_job_metadata(local_output_root, metadata)
+            delete_pod_on_exit = not args.keep_pod
+            print(
+                json.dumps(
+                    {
+                        "pod_id": pod_id,
+                        "local_output": str(local_output_root),
+                        "remote_state": state,
+                        "finalized": finalized is not None,
+                    },
+                    indent=2,
+                )
+            )
+            return
         if args.prepare_only or not args.reuse_pod_workspace:
             base_archive = build_base_archive()
             dataset_archive = build_dataset_archive(args)
@@ -418,10 +807,37 @@ def main() -> None:
             args.remote_output,
             reuse_workspace=args.reuse_pod_workspace,
         )
-        proc = ctl.ssh(ssh_info, remote_command, check=False)
         logs_dir = REPO_ROOT / "artifacts" / "logs" / "runpod"
         logs_dir.mkdir(parents=True, exist_ok=True)
         log_stem = f"{pod_id}.{args.name}"
+        if args.detach_remote:
+            launch = _launch_detached_remote_job(ctl, ssh_info, args=args, remote_command=remote_command)
+            (logs_dir / f"{log_stem}.stdout.log").write_text(str(launch.get("stdout", "")), encoding="utf-8")
+            (logs_dir / f"{log_stem}.stderr.log").write_text(str(launch.get("stderr", "")), encoding="utf-8")
+            metadata = _job_metadata_payload(args, pod_id=pod_id, detached=True, status="launched")
+            metadata["remote_pid"] = launch.get("remote_pid")
+            metadata["remote_paths"] = launch.get("remote_paths")
+            watcher_pid = _spawn_collect_watcher(args, local_output_root)
+            metadata["watcher_pid"] = watcher_pid
+            _write_job_metadata(local_output_root, metadata)
+            if launch["returncode"] != 0:
+                raise SystemExit(launch["returncode"])
+            print(
+                json.dumps(
+                    {
+                        "pod_id": pod_id,
+                        "ssh": ssh_info,
+                        "remote_pid": launch.get("remote_pid"),
+                        "watcher_pid": watcher_pid,
+                        "remote_paths": launch.get("remote_paths"),
+                        "local_output": str(local_output_root),
+                        "metadata_path": str(_metadata_path(local_output_root)),
+                    },
+                    indent=2,
+                )
+            )
+            return
+        proc = ctl.ssh(ssh_info, remote_command, check=False)
         (logs_dir / f"{log_stem}.stdout.log").write_text(proc.stdout, encoding="utf-8")
         (logs_dir / f"{log_stem}.stderr.log").write_text(proc.stderr, encoding="utf-8")
         if args.prepare_only:
@@ -450,38 +866,8 @@ def main() -> None:
             }
             print(json.dumps(summary, indent=2))
             raise SystemExit(proc.returncode or 1)
-        local_output_root = REPO_ROOT / args.local_output
         _sync_remote_output(ctl, ssh_info, remote_output_path, local_output_root)
-        subprocess.run(["./scripts/build_simh.sh"], cwd=REPO_ROOT, check=True)
-        if args.run_mode == "overfit-sanity":
-            finalize_overfit_output(
-                dataset_index=REPO_ROOT / args.dataset_index,
-                output_root=local_output_root,
-                failure_archive_limit=args.failure_archive_limit,
-                repo_root=REPO_ROOT,
-                step_budget=args.step_budget,
-                timeout_seconds=args.timeout_seconds,
-            )
-        elif args.run_mode == "inference-only":
-            finalize_train_eval_output(
-                dataset_root=REPO_ROOT / f"artifacts/datasets/{args.dataset_name}",
-                output_root=local_output_root,
-                eval_split=args.eval_split,
-                failure_archive_limit=args.failure_archive_limit,
-                repo_root=REPO_ROOT,
-                step_budget=args.step_budget,
-                timeout_seconds=args.timeout_seconds,
-            )
-        else:
-            finalize_train_eval_output(
-                dataset_root=REPO_ROOT / f"artifacts/datasets/{args.dataset_name}",
-                output_root=local_output_root,
-                eval_split=args.eval_split,
-                failure_archive_limit=args.failure_archive_limit,
-                repo_root=REPO_ROOT,
-                step_budget=args.step_budget,
-                timeout_seconds=args.timeout_seconds,
-            )
+        _finalize_local_output(args, local_output_root)
         summary = {
             "pod_id": pod_id,
             "pod": pod,
@@ -492,8 +878,10 @@ def main() -> None:
         print(json.dumps(summary, indent=2))
         if proc.returncode != 0:
             raise SystemExit(proc.returncode)
+        if not args.keep_pod and not args.pod_id and not args.detach_remote:
+            delete_pod_on_exit = True
     finally:
-        if not args.keep_pod and not args.pod_id:
+        if delete_pod_on_exit:
             try:
                 ctl.delete_pod(pod_id)
             except Exception:

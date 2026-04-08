@@ -81,18 +81,55 @@ def _generate_b2(seed: int) -> Program:
     branch_point = rng.randint(2, limit - 1)
     inc_primary = _float_literal(rng)
     inc_secondary = _float_literal(rng)
-    statements = [
-        Assign(1, Var("i", IntConst(1)), IntConst(0)),
-        Assign(2, Var("c", IntConst(1)), FloatConst("0j")),
-        Assign(3, Var("i", IntConst(1)), Add(Var("i", IntConst(1)), IntConst(1))),
-        IfGoto(4, 9, Var("i", IntConst(1)), "w", IntConst(limit)),
-        IfGoto(5, 7, Var("i", IntConst(1)), "u", IntConst(branch_point)),
-        Assign(6, Var("c", IntConst(1)), Add(Var("c", IntConst(1)), inc_primary)),
-        Assign(7, Var("c", IntConst(1)), Add(Var("c", IntConst(1)), inc_secondary)),
-        Goto(8, 3),
-        Punch(9, (Var("i", IntConst(1)), Var("c", IntConst(1)))),
-        Halt(10),
-    ]
+    family = rng.choice(["branch_accumulate", "dual_accumulator", "post_branch_mix"])
+    if family == "branch_accumulate":
+        statements = [
+            Assign(1, Var("i", IntConst(1)), IntConst(0)),
+            Assign(2, Var("c", IntConst(1)), FloatConst("0j")),
+            Assign(3, Var("i", IntConst(1)), Add(Var("i", IntConst(1)), IntConst(1))),
+            IfGoto(4, 9, Var("i", IntConst(1)), "w", IntConst(limit)),
+            IfGoto(5, 7, Var("i", IntConst(1)), "u", IntConst(branch_point)),
+            Assign(6, Var("c", IntConst(1)), Add(Var("c", IntConst(1)), inc_primary)),
+            Assign(7, Var("c", IntConst(1)), Add(Var("c", IntConst(1)), inc_secondary)),
+            Goto(8, 3),
+            Punch(9, (Var("i", IntConst(1)), Var("c", IntConst(1)))),
+            Halt(10),
+        ]
+    elif family == "dual_accumulator":
+        y_seed = _float_literal(rng)
+        statements = [
+            Assign(1, Var("i", IntConst(1)), IntConst(0)),
+            Assign(2, Var("c", IntConst(1)), FloatConst("0j")),
+            Assign(3, Var("y", IntConst(1)), y_seed),
+            Assign(4, Var("i", IntConst(1)), Add(Var("i", IntConst(1)), IntConst(1))),
+            IfGoto(5, 11, Var("i", IntConst(1)), "w", IntConst(limit)),
+            IfGoto(6, 8, Var("i", IntConst(1)), "u", IntConst(branch_point)),
+            Assign(7, Var("y", IntConst(1)), Add(Var("y", IntConst(1)), inc_primary)),
+            Assign(8, Var("c", IntConst(1)), Add(Var("c", IntConst(1)), inc_secondary)),
+            Assign(9, Var("c", IntConst(2)), Add(Var("y", IntConst(1)), Var("c", IntConst(1)))),
+            Goto(10, 4),
+            Punch(11, (Var("i", IntConst(1)), Var("y", IntConst(1)), Var("c", IntConst(2)))),
+            Halt(12),
+        ]
+    else:
+        y_seed = rng.choice([FloatConst("0j"), _float_literal(rng)])
+        bias = _float_literal(rng)
+        statements = [
+            Assign(1, Var("i", IntConst(1)), IntConst(0)),
+            Assign(2, Var("c", IntConst(1)), FloatConst("0j")),
+            Assign(3, Var("y", IntConst(1)), y_seed),
+            Assign(4, Var("i", IntConst(1)), Add(Var("i", IntConst(1)), IntConst(1))),
+            IfGoto(5, 12, Var("i", IntConst(1)), "w", IntConst(limit)),
+            IfGoto(6, 9, Var("i", IntConst(1)), "u", IntConst(branch_point)),
+            Assign(7, Var("c", IntConst(1)), Add(Var("c", IntConst(1)), inc_primary)),
+            Goto(8, 10),
+            Assign(9, Var("y", IntConst(1)), Add(Var("y", IntConst(1)), inc_secondary)),
+            Assign(10, Var("c", IntConst(2)), Add(Var("c", IntConst(1)), Var("y", IntConst(1)))),
+            Goto(11, 4),
+            Assign(12, Var("y", IntConst(2)), Add(Var("c", IntConst(2)), bias)),
+            Punch(13, (Var("i", IntConst(1)), Var("c", IntConst(2)), Var("y", IntConst(2)))),
+            Halt(14),
+        ]
     program = Program(statements=tuple(statements))
     return Program(statements=program.statements, header=compute_header(program))
 
@@ -100,7 +137,7 @@ def _generate_b2(seed: int) -> Program:
 def _generate_b3(seed: int) -> Program:
     rng = random.Random(seed)
     start_expr, step_expr, stop_expr = _loop_bounds(rng)
-    family = rng.choice(["indexed_sum", "progressive_store", "postmix_store"])
+    family = rng.choice(["indexed_sum", "progressive_store", "postmix_store", "indexed_feedback", "indexed_pair_store"])
 
     if family == "indexed_sum":
         base = rng.choice([FloatConst("0j"), _float_literal(rng), _float_literal(rng)])
@@ -129,7 +166,7 @@ def _generate_b3(seed: int) -> Program:
             Punch(7, (Var("y", IntConst(1)), Var("c", IntConst(1)))),
             Halt(8),
         ]
-    else:
+    elif family == "postmix_store":
         base = rng.choice([FloatConst("0j"), _float_literal(rng)])
         increment = _float_literal(rng)
         mix = _float_literal(rng)
@@ -142,6 +179,37 @@ def _generate_b3(seed: int) -> Program:
             Assign(6, Var("y", IntConst(2)), Add(Var("y", IntConst(1)), Var("c", IntConst(1)))),
             Punch(7, (Var("y", IntConst(1)), Var("y", IntConst(2)))),
             Halt(8),
+        ]
+    elif family == "indexed_feedback":
+        base = rng.choice([FloatConst("0j"), _float_literal(rng)])
+        seed_value = _float_literal(rng)
+        delta = _float_literal(rng)
+        statements = [
+            Assign(1, Var("y", IntConst(1)), base),
+            Assign(2, Var("c", IntConst(1)), seed_value),
+            Iterate(3, 7, Var("i", IntConst(1)), start_expr, step_expr, stop_expr),
+            Assign(4, Var("y", Var("i", IntConst(1))), Add(Var("y", IntConst(1)), Var("c", IntConst(1)))),
+            Assign(5, Var("c", IntConst(2)), Add(Var("y", Var("i", IntConst(1))), delta)),
+            Assign(6, Var("c", IntConst(1)), Var("c", IntConst(2))),
+            Assign(7, Var("y", IntConst(1)), Var("y", Var("i", IntConst(1)))),
+            Assign(8, Var("c", IntConst(3)), Add(Var("y", IntConst(1)), Var("c", IntConst(1)))),
+            Punch(9, (Var("y", IntConst(1)), Var("c", IntConst(1)), Var("c", IntConst(3)))),
+            Halt(10),
+        ]
+    else:
+        base = rng.choice([FloatConst("0j"), _float_literal(rng)])
+        increment = _float_literal(rng)
+        bias = _float_literal(rng)
+        statements = [
+            Assign(1, Var("c", IntConst(1)), base),
+            Assign(2, Var("y", IntConst(1)), FloatConst("0j")),
+            Iterate(3, 6, Var("i", IntConst(1)), start_expr, step_expr, stop_expr),
+            Assign(4, Var("c", Var("i", IntConst(1))), Add(Var("c", IntConst(1)), increment)),
+            Assign(5, Var("y", Var("i", IntConst(1))), Add(Var("y", IntConst(1)), Var("c", Var("i", IntConst(1))))),
+            Assign(6, Var("y", IntConst(1)), Var("y", Var("i", IntConst(1)))),
+            Assign(7, Var("c", IntConst(2)), Add(Var("y", IntConst(1)), bias)),
+            Punch(8, (Var("y", IntConst(1)), Var("c", IntConst(1)), Var("c", IntConst(2)))),
+            Halt(9),
         ]
     program = Program(statements=tuple(statements))
     return Program(statements=program.statements, header=compute_header(program))

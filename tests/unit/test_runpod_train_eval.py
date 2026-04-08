@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import tarfile
 from pathlib import Path
 
@@ -38,12 +39,14 @@ def test_remote_train_command_uses_no_same_owner() -> None:
         step_budget="50M",
         timeout_seconds=30,
         example_count=32,
+        band_repeat=["B2=2", "B3=3"],
     )
     command = runpod_train_eval.remote_train_command(args, "artifacts/eval_reports/out")
     assert "tar --no-same-owner --no-same-permissions -xzf /workspace/ibmotron-base.tgz -C /workspace" in command
     assert "tar --no-same-owner --no-same-permissions -xzf /workspace/ibmotron-dataset.tgz -C /workspace" in command
     assert "./scripts/build_simh.sh" not in command
     assert "--eval-mode skip" in command
+    assert "--band-repeat B2=2 --band-repeat B3=3" in command
 
 
 def test_remote_prepare_command_bootstraps_runtime_only() -> None:
@@ -159,6 +162,84 @@ def test_remote_inference_only_command_resumes_fine_tuned_predictions() -> None:
     assert "--limit 200" in command
     assert "--eval-mode skip" in command
     assert "python -m ibm650_it.cli train-eval" not in command
+
+
+def test_build_remote_job_script_tracks_state_file() -> None:
+    args = argparse.Namespace(
+        name="detached-test",
+        run_mode="inference-only",
+        remote_output="artifacts/eval_reports/out",
+    )
+
+    script = runpod_train_eval._build_remote_job_script(args, "echo hello")
+
+    assert "IBMOTRON_JOB_STATUS" in script
+    assert runpod_train_eval.REMOTE_JOB_STATE_FILENAME in script
+    assert "bash -lc 'echo hello'" in script
+    assert "running" in script
+    assert "complete" in script and "failed" in script
+
+
+def test_job_metadata_round_trip(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(runpod_train_eval, "REPO_ROOT", tmp_path)
+    output_root = tmp_path / "artifacts" / "eval_reports" / "out"
+    payload = {
+        "pod_id": "pod-123",
+        "run_mode": "inference-only",
+        "local_output": "artifacts/eval_reports/out",
+        "status": "launched",
+    }
+
+    path = runpod_train_eval._write_job_metadata(output_root, payload)
+    loaded = runpod_train_eval._load_job_metadata(output_root)
+
+    assert path == output_root / runpod_train_eval.LOCAL_JOB_METADATA_FILENAME
+    assert loaded == payload
+
+
+def test_spawn_collect_watcher_uses_watch_mode(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(runpod_train_eval, "REPO_ROOT", tmp_path)
+    output_root = tmp_path / "artifacts" / "eval_reports" / "out"
+    output_root.mkdir(parents=True)
+    calls: list[list[str]] = []
+
+    class FakePopen:
+        def __init__(self, argv, **kwargs):
+            calls.append(list(argv))
+            self.pid = 43210
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+    args = argparse.Namespace(
+        local_output="artifacts/eval_reports/out",
+        auto_collect_poll_seconds=60,
+    )
+
+    pid = runpod_train_eval._spawn_collect_watcher(args, output_root)
+
+    assert pid == 43210
+    assert calls
+    assert "--watch-collect" in calls[0]
+    assert "--local-output" in calls[0]
+    assert "artifacts/eval_reports/out" in calls[0]
+
+
+def test_watch_collect_marks_complete_when_summary_exists(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(runpod_train_eval, "REPO_ROOT", tmp_path)
+    output_root = tmp_path / "artifacts" / "eval_reports" / "out"
+    output_root.mkdir(parents=True)
+    (output_root / "summary.json").write_text("{}", encoding="utf-8")
+    (output_root / runpod_train_eval.LOCAL_JOB_METADATA_FILENAME).write_text(
+        json.dumps({"pod_id": "pod-123", "local_output": "artifacts/eval_reports/out", "status": "launched"}),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(local_output="artifacts/eval_reports/out", pod_id=None, remote_output=None, auto_collect_poll_seconds=0)
+
+    rc = runpod_train_eval._run_collect_watcher(args)
+
+    assert rc == 0
+    metadata = json.loads((output_root / runpod_train_eval.LOCAL_JOB_METADATA_FILENAME).read_text(encoding="utf-8"))
+    assert metadata["status"] == "complete"
 
 
 def test_remote_train_command_infers_full_split_sizes_when_caps_omitted(tmp_path: Path, monkeypatch) -> None:

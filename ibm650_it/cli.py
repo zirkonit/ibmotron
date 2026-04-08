@@ -11,6 +11,7 @@ from ibm650_it.dataset.corpus import build_pilot_corpus, build_stage_corpus, par
 from ibm650_it.dataset.subset import slice_dataset
 from ibm650_it.eval.archive import archive_failures
 from ibm650_it.eval.b1_failure_review import build_b1_failure_review
+from ibm650_it.eval.band_failure_review import build_band_failure_review
 from ibm650_it.eval.finalize import finalize_overfit_output, finalize_train_eval_output, reevaluate_and_report_mode
 from ibm650_it.eval.report import build_evaluation_report, compare_mode_reports
 from ibm650_it.eval.research_report import write_research_report
@@ -19,7 +20,7 @@ from ibm650_it.pit.normalize_pit import canonicalize_pit_file
 from ibm650_it.simh.runner import SimhRunner
 from ibm650_it.source.render_it_text import render_program
 from ibm650_it.training.infer import run_inference
-from ibm650_it.training.prepare_sft import prepare_sft_examples
+from ibm650_it.training.prepare_sft import parse_band_repeats, prepare_sft_examples
 from ibm650_it.training.thinking_ablation import run_thinking_ablation
 from ibm650_it.training.train_unsloth import TrainConfig, train_model
 
@@ -132,6 +133,7 @@ def cmd_prepare_sft(args: argparse.Namespace) -> None:
         dataset_index=Path(args.dataset_index),
         output_path=Path(args.output),
         limit=args.limit,
+        band_repeats=parse_band_repeats(args.band_repeat),
     )
     _print_json({"records_written": records, "output": args.output})
 
@@ -253,6 +255,16 @@ def cmd_review_b1_failures(args: argparse.Namespace) -> None:
     _print_json(summary)
 
 
+def cmd_review_band_failures(args: argparse.Namespace) -> None:
+    summary = build_band_failure_review(
+        reference_index=Path(args.reference_index),
+        prediction_index=Path(args.prediction_index),
+        output_root=Path(args.output),
+        bands=args.band,
+    )
+    _print_json(summary)
+
+
 def cmd_build_record(args: argparse.Namespace) -> None:
     runner = _runner()
     pipeline = runner.reference_pipeline(
@@ -325,7 +337,11 @@ def cmd_train_eval(args: argparse.Namespace) -> None:
     train_index = dataset_root / "splits" / args.train_split
     eval_index = dataset_root / "splits" / args.eval_split
     sft_path = output_root / "sft" / "train.jsonl"
-    records_written = prepare_sft_examples(dataset_index=train_index, output_path=sft_path)
+    records_written = prepare_sft_examples(
+        dataset_index=train_index,
+        output_path=sft_path,
+        band_repeats=parse_band_repeats(args.band_repeat),
+    )
 
     train_summary = train_model(
         sft_path=sft_path,
@@ -395,6 +411,7 @@ def cmd_overfit_sanity(args: argparse.Namespace) -> None:
         dataset_index=dataset_index,
         output_path=sft_path,
         limit=args.example_count,
+        band_repeats=parse_band_repeats(args.band_repeat),
     )
     train_summary = train_model(
         sft_path=sft_path,
@@ -516,6 +533,7 @@ def build_parser() -> argparse.ArgumentParser:
     sft.add_argument("--dataset-index", required=True)
     sft.add_argument("--output", required=True)
     sft.add_argument("--limit", type=int)
+    sft.add_argument("--band-repeat", action="append", default=[])
     sft.set_defaults(func=cmd_prepare_sft)
 
     pilot = subparsers.add_parser("build-pilot-corpus")
@@ -610,6 +628,13 @@ def build_parser() -> argparse.ArgumentParser:
     review_b1.add_argument("--output", required=True)
     review_b1.set_defaults(func=cmd_review_b1_failures)
 
+    review_bands = subparsers.add_parser("review-band-failures")
+    review_bands.add_argument("--reference-index", required=True)
+    review_bands.add_argument("--prediction-index", required=True)
+    review_bands.add_argument("--output", required=True)
+    review_bands.add_argument("--band", action="append", required=True)
+    review_bands.set_defaults(func=cmd_review_band_failures)
+
     record = subparsers.add_parser("build-record")
     record.add_argument("--source", required=True)
     record.add_argument("--output", required=True)
@@ -666,6 +691,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_eval.add_argument("--train-split", default="synthetic_train.jsonl")
     train_eval.add_argument("--eval-split", default="synthetic_dev.jsonl")
     train_eval.add_argument("--few-shot-k", type=int, default=4)
+    train_eval.add_argument("--band-repeat", action="append", default=[])
     train_eval.add_argument("--limit", type=int)
     train_eval.add_argument("--max-examples", type=int)
     train_eval.add_argument("--max-new-tokens", type=int, default=1024)
@@ -681,6 +707,7 @@ def build_parser() -> argparse.ArgumentParser:
     smoke_train.add_argument("--train-split", default="synthetic_train.jsonl")
     smoke_train.add_argument("--eval-split", default="synthetic_dev.jsonl")
     smoke_train.add_argument("--few-shot-k", type=int, default=4)
+    smoke_train.add_argument("--band-repeat", action="append", default=[])
     smoke_train.add_argument("--limit", type=int)
     smoke_train.add_argument("--max-examples", type=int)
     smoke_train.add_argument("--max-new-tokens", type=int, default=1024)
@@ -712,6 +739,7 @@ def build_parser() -> argparse.ArgumentParser:
     overfit.add_argument("--max-seq-length", type=int, default=4096)
     overfit.add_argument("--per-device-train-batch-size", type=int, default=1)
     overfit.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    overfit.add_argument("--band-repeat", action="append", default=[])
     overfit.add_argument("--max-new-tokens", type=int, default=1024)
     overfit.add_argument("--eval-mode", choices=["inline", "skip"], default="inline")
     overfit.add_argument("--failure-archive-limit", type=int, default=25)

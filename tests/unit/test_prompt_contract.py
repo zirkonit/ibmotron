@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from ibm650_it.eval.failure_taxonomy import classify_failure
-from ibm650_it.training.prepare_sft import prepare_sft_examples
+from ibm650_it.training.prepare_sft import parse_band_repeats, prepare_sft_examples
 from ibm650_it.training.prompt_templates import (
     build_chat_messages,
     build_few_shot_chat_messages,
@@ -83,6 +83,44 @@ def test_prepare_sft_examples_wraps_targets(tmp_path: Path) -> None:
     row = output.read_text(encoding="utf-8")
     assert '"completion": "<PIT>\\ncard-1\\ncard-2\\n</PIT>"' in row
     assert '"target_text": "card-1\\ncard-2\\n"' in row
+
+
+def test_prepare_sft_examples_can_oversample_selected_bands(tmp_path: Path) -> None:
+    target = tmp_path / "target.dck"
+    target.write_text("card-1\n", encoding="latin-1")
+    source = tmp_path / "source.it"
+    source.write_text("+ 0 1 0 3 1730\n0001+ y1 z 2j f\n0002+ t y1 f\n0003+ h ff\n", encoding="utf-8")
+    index = tmp_path / "index.jsonl"
+    index.write_text(
+        "\n".join(
+            [
+                '{"id":"b2","band":"B2","source":{"it_text_v1":"source.it"},'
+                '"reference":{"translate":{"pit_raw_canonical":"target.dck"}}}',
+                '{"id":"b0","band":"B0","source":{"it_text_v1":"source.it"},'
+                '"reference":{"translate":{"pit_raw_canonical":"target.dck"}}}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "train.jsonl"
+
+    count = prepare_sft_examples(
+        dataset_index=index,
+        output_path=output,
+        band_repeats={"B2": 3},
+    )
+
+    rows = [line for line in output.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert count == 4
+    assert len(rows) == 4
+    assert sum('"id": "b2"' in row for row in rows) == 3
+    assert sum('"id": "b0"' in row for row in rows) == 1
+    assert '"repeat_index": 2' in rows[2]
+
+
+def test_parse_band_repeats_parses_cli_values() -> None:
+    assert parse_band_repeats(["B2=2", "b3=3"]) == {"B2": 2, "B3": 3}
 
 
 def test_failure_taxonomy_distinguishes_it_source_echo_from_generic_malformed_pit() -> None:

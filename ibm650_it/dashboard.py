@@ -5,7 +5,6 @@ import json
 import os
 import re
 import shlex
-import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -20,6 +19,7 @@ from ibm650_it.cloud.runpod import RunpodCtl
 from ibm650_it.eval.locking import FINALIZE_STATE_FILENAME
 
 
+RUNPOD_JOB_METADATA_FILENAME = ".runpod_job.json"
 HTML_PAGE = """<!doctype html>
 <html lang="en">
 <head>
@@ -187,6 +187,7 @@ HTML_PAGE = """<!doctype html>
       if (!progress || Object.keys(progress).length === 0) return '<span class="muted">n/a</span>';
       return Object.entries(progress).map(([name, data]) => {
         const parts = [];
+        if (data.training) parts.push(`train ${data.training.current}/${data.training.total}`);
         if (data.lines !== undefined) parts.push(`${data.lines}/${data.expected ?? "?"}`);
         if (data.summary_exists) parts.push("summary");
         if (data.report_exists) parts.push("report");
@@ -210,7 +211,7 @@ HTML_PAGE = """<!doctype html>
           <div class="row"><div class="label">Name</div><div class="value mono">${safe(job.name)}</div></div>
           <div class="row"><div class="label">Local PID</div><div class="value mono">${safe(job.pid)} · ${safe(job.elapsed)}</div></div>
           <div class="row"><div class="label">Pod</div><div class="value mono">${safe(job.pod_id || "")} ${job.pod ? `· ${safe(job.pod.gpu || "")} · $${safe(job.pod.cost_per_hr)}/hr` : ""}</div></div>
-          <div class="row"><div class="label">Remote</div><div class="value">${job.remote ? safe(job.remote.phase || "unknown") : '<span class="muted">unavailable</span>'}</div></div>
+          <div class="row"><div class="label">Remote</div><div class="value">${job.remote ? safe(job.remote.subphase || job.remote.phase || "unknown") : '<span class="muted">unavailable</span>'}</div></div>
           <div class="row"><div class="label">Local</div><div class="value">${job.local ? safe(job.local.phase || "unknown") : '<span class="muted">n/a</span>'}</div></div>
           <div class="row"><div class="label">Progress</div><div class="value">${renderProgress(job.remote ? job.remote.progress : {})}</div></div>
           <div class="row"><div class="label">GPU</div><div class="value mono">${job.remote && job.remote.gpu ? safe(job.remote.gpu) : '<span class="muted">n/a</span>'}</div></div>
@@ -307,6 +308,7 @@ HTML_PAGE = """<!doctype html>
 
 
 PS_RE = re.compile(r"^\s*(\d+)\s+(\S+)\s+(.*)$")
+TRAIN_STEP_RE = re.compile(r"(?P<current>\d+)\s*/\s*(?P<total>\d+)")
 
 
 @dataclass(slots=True)
@@ -319,6 +321,8 @@ class DashboardConfig:
 
 
 def _run_command(command: list[str], *, timeout_seconds: int = 10) -> subprocess.CompletedProcess[str]:
+    import subprocess
+
     return subprocess.run(
         command,
         cwd=REPO_ROOT,
@@ -331,9 +335,9 @@ def _run_command(command: list[str], *, timeout_seconds: int = 10) -> subprocess
 
 def _parse_launcher_args(command: str) -> dict[str, Any]:
     argv = shlex.split(command)
-    if "scripts/runpod_train_eval.py" not in argv:
+    script_index = next((index for index, token in enumerate(argv) if Path(token).name == "runpod_train_eval.py"), None)
+    if script_index is None:
         return {}
-    script_index = argv.index("scripts/runpod_train_eval.py")
     flags = argv[script_index + 1 :]
     parsed: dict[str, Any] = {}
     index = 0
@@ -365,7 +369,7 @@ def collect_active_wrappers() -> list[dict[str, Any]]:
         if not match:
             continue
         pid, elapsed, command = match.groups()
-        if "scripts/runpod_train_eval.py" not in command:
+        if "runpod_train_eval.py" not in command:
             continue
         args = _parse_launcher_args(command)
         jobs.append(
@@ -381,8 +385,9 @@ def collect_active_wrappers() -> list[dict[str, Any]]:
                 "remote_output": args.get("remote_output"),
                 "local_output": args.get("local_output"),
                 "limit": int(args["limit"]) if args.get("limit") else None,
-                "example_count": int(args["example_count"]) if args.get("example_count") else None,
+                "example_count": int(args["example_count"]) if args.get("example_count") else (int(args["max_examples"]) if args.get("max_examples") else None),
                 "pod_id_arg": args.get("pod_id"),
+                "detached": bool(args.get("detach_remote")),
             }
         )
     return jobs
@@ -426,6 +431,8 @@ def collect_pods() -> list[dict[str, Any]]:
 
 def _expected_modes(run_mode: str) -> list[str]:
     if run_mode == "overfit-sanity":
+        return ["fine_tuned"]
+    if run_mode == "inference-only":
         return ["fine_tuned"]
     if run_mode == "thinking-ablation":
         return ["thinking_on", "thinking_off"]
@@ -476,10 +483,10 @@ def _inspect_local_output(local_output: str | None, run_mode: str) -> dict[str, 
 def _ssh_remote_status(pod_id: str, remote_output: str, run_mode: str, expected_count: int | None, timeout_seconds: int) -> dict[str, Any]:
     ctl = RunpodCtl()
     info = ctl.ssh_info(pod_id)
-    user, host, port = ctl._ssh_target(info)
     remote_script = f"""
 import json
 import subprocess
+import re
 from pathlib import Path
 
 root = Path("/workspace/ibmotron")
@@ -492,6 +499,9 @@ data = {{
     "progress": {{}},
     "active_process": False,
     "gpu": None,
+    "state": None,
+    "log_tail": [],
+    "training": None,
 }}
 try:
     gpu = subprocess.run(
@@ -503,16 +513,48 @@ try:
     data["gpu"] = gpu or None
 except Exception:
     pass
-ps_text = subprocess.run(
-    ["bash", "-lc", "ps -eo pid,etime,pcpu,pmem,command | egrep 'python -m ibm650_it.cli (train-eval|overfit-sanity)' | grep -v grep || true"],
+state_path = output / ".runpod_remote_state.json"
+if state_path.exists():
+    try:
+        data["state"] = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+log_path = output / ".runpod_remote.log"
+if log_path.exists():
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        data["log_tail"] = lines[-20:]
+        for line in reversed(lines[-250:]):
+            match = re.search(r"(\\d+)\\s*/\\s*(\\d+)", line)
+            if match:
+                current = int(match.group(1))
+                total = int(match.group(2))
+                if total > 0 and current <= total:
+                    data["training"] = {{"current": current, "total": total}}
+                    break
+    except Exception:
+        pass
+active_text = subprocess.run(
+    ["bash", "-lc", "ps -eo pid,etimes,pcpu,pmem,command | grep -E 'python -m ibm650_it\\.cli (train-eval|overfit-sanity|run-inference)' | grep -v grep || true"],
     text=True,
     capture_output=True,
     check=False,
 ).stdout.strip()
-data["process"] = ps_text
-data["active_process"] = bool(ps_text)
+bootstrap_text = subprocess.run(
+    ["bash", "-lc", "ps -eo pid,etimes,pcpu,pmem,command | grep -E 'apt-get|pip install|python3 -m venv' | grep -v grep || true"],
+    text=True,
+    capture_output=True,
+    check=False,
+).stdout.strip()
+data["process"] = active_text
+data["bootstrap_process"] = bootstrap_text
+data["active_process"] = bool(active_text or bootstrap_text)
 if output.exists():
     if {json.dumps(run_mode)} == "overfit-sanity":
+        modes = ["fine_tuned"]
+    elif {json.dumps(run_mode)} == "thinking-ablation":
+        modes = ["thinking_on", "thinking_off"]
+    elif {json.dumps(run_mode)} == "inference-only":
         modes = ["fine_tuned"]
     else:
         modes = ["zero_shot", "few_shot", "fine_tuned"]
@@ -532,26 +574,7 @@ if output.exists():
         }}
 print(json.dumps(data))
 """
-    proc = subprocess.run(
-        [
-            "ssh",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-i",
-            str(Path.home() / ".ssh" / "id_ed25519"),
-            "-p",
-            port,
-            f"{user}@{host}",
-            f"python3 - <<'PY'\n{remote_script}\nPY",
-        ],
-        cwd=REPO_ROOT,
-        text=True,
-        capture_output=True,
-        timeout=timeout_seconds,
-        check=False,
-    )
+    proc = ctl.ssh(info, f"python3 - <<'PY'\n{remote_script}\nPY", check=False)
     if proc.returncode != 0:
         return {"error": proc.stderr.strip() or proc.stdout.strip() or f"ssh failed: {proc.returncode}"}
     return json.loads(proc.stdout)
@@ -570,6 +593,9 @@ def _phase_class(phase: str) -> str:
 def _derive_remote_subphase(remote: dict[str, Any] | None) -> str | None:
     if remote is None or remote.get("error"):
         return None
+    training = remote.get("training")
+    if isinstance(training, dict) and training.get("total"):
+        return f"train {training.get('current', 0)}/{training.get('total')}"
     progress = remote.get("progress", {})
     for mode in ["fine_tuned", "few_shot", "zero_shot"]:
         mode_progress = progress.get(mode, {})
@@ -589,6 +615,22 @@ def _derive_remote_phase(remote: dict[str, Any] | None) -> str | None:
         return None
     if remote.get("error"):
         return "failed"
+    active_text = str(remote.get("process") or "")
+    bootstrap_text = str(remote.get("bootstrap_process") or "")
+    state = remote.get("state") or {}
+    progress = remote.get("progress", {})
+    if state.get("status") == "failed":
+        return "failed"
+    if any(progress.get(mode, {}).get("lines", 0) > 0 for mode in progress):
+        return "remote_generate"
+    if "python -m ibm650_it.cli run-inference" in active_text:
+        return "remote_generate"
+    if "python -m ibm650_it.cli train-eval" in active_text or "python -m ibm650_it.cli overfit-sanity" in active_text:
+        return "remote_train"
+    if remote.get("training"):
+        return "remote_train"
+    if any(token in bootstrap_text for token in ["apt-get", "pip install", "python3 -m venv"]):
+        return "remote_bootstrap"
     if not remote.get("repo_exists"):
         return "remote_bootstrap"
     if not remote.get("output_exists"):
@@ -601,7 +643,15 @@ def _derive_remote_phase(remote: dict[str, Any] | None) -> str | None:
 
 
 def _derive_phase(job: dict[str, Any], remote: dict[str, Any] | None, local: dict[str, Any] | None) -> str:
-    archive_size = _read_archive_size(job["pid"])
+    archive_size = _read_archive_size(job["pid"]) if job.get("pid") else None
+    if job.get("detached") and remote is not None and remote.get("active_process"):
+        if remote.get("phase"):
+            return str(remote["phase"])
+        if remote.get("training"):
+            return "remote_train"
+        if _derive_remote_subphase(remote):
+            return "remote_generate"
+        return "remote_train"
     if local is not None and local.get("phase") == "failed":
         return "failed"
     if local is not None and local.get("phase") == "local_reevaluate":
@@ -635,15 +685,66 @@ def _match_pod(job: dict[str, Any], pods_by_id: dict[str, dict[str, Any]], pods_
     return None
 
 
+def collect_detached_jobs(active_wrappers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    eval_root = REPO_ROOT / "artifacts" / "eval_reports"
+    active_outputs = {str(item.get("local_output") or "") for item in active_wrappers}
+    jobs: list[dict[str, Any]] = []
+    for metadata_path in sorted(eval_root.rglob(RUNPOD_JOB_METADATA_FILENAME)):
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        local_output = str(payload.get("local_output") or "")
+        if not local_output or local_output in active_outputs:
+            continue
+        if payload.get("status") == "complete":
+            continue
+        jobs.append(
+            {
+                "pid": None,
+                "elapsed": "detached",
+                "command": "detached remote job",
+                "name": payload.get("name"),
+                "run_mode": payload.get("run_mode"),
+                "gpu_id": None,
+                "dataset_name": payload.get("dataset_name"),
+                "dataset_index": payload.get("dataset_index"),
+                "remote_output": payload.get("remote_output"),
+                "local_output": local_output,
+                "limit": payload.get("limit"),
+                "example_count": payload.get("example_count"),
+                "pod_id_arg": payload.get("pod_id"),
+                "detached": True,
+            }
+        )
+    return jobs
+
+
+def _job_metadata_by_local_output() -> dict[str, dict[str, Any]]:
+    eval_root = REPO_ROOT / "artifacts" / "eval_reports"
+    payloads: dict[str, dict[str, Any]] = {}
+    for metadata_path in sorted(eval_root.rglob(RUNPOD_JOB_METADATA_FILENAME)):
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        local_output = str(payload.get("local_output") or "")
+        if local_output:
+            payloads[local_output] = payload
+    return payloads
+
+
 def collect_recent_runs(limit: int = 8) -> list[dict[str, Any]]:
     eval_root = REPO_ROOT / "artifacts" / "eval_reports"
     runs: list[dict[str, Any]] = []
     for summary_path in sorted(eval_root.rglob("summary.json"), key=lambda path: path.stat().st_mtime, reverse=True):
-        if any(part in {"predictions", "reports", "failures", "model", "sft"} for part in summary_path.parts):
+        if any(part in {"predictions", "reports", "failures", "model", "sft", "selected_failures"} for part in summary_path.parts):
             continue
         try:
             payload = json.loads(summary_path.read_text(encoding="utf-8"))
         except Exception:
+            continue
+        if not any(key in payload for key in {"train", "evaluations", "fine_tuned"}):
             continue
         runs.append(
             {
@@ -663,12 +764,36 @@ def collect_recent_runs(limit: int = 8) -> list[dict[str, Any]]:
 
 def collect_dashboard_status(config: DashboardConfig) -> dict[str, Any]:
     wrappers = collect_active_wrappers()
+    metadata_by_local_output = _job_metadata_by_local_output()
+    for job in wrappers:
+        local_output = str(job.get("local_output") or "")
+        payload = metadata_by_local_output.get(local_output)
+        if payload is None:
+            continue
+        for field in [
+            "name",
+            "run_mode",
+            "dataset_name",
+            "dataset_index",
+            "remote_output",
+            "local_output",
+            "limit",
+            "example_count",
+            "pod_id_arg",
+        ]:
+            if not job.get(field) and payload.get(field) is not None:
+                job[field] = payload.get(field)
+        if payload.get("max_examples") is not None and not job.get("example_count"):
+            job["example_count"] = payload.get("max_examples")
+        if payload.get("detached") is not None:
+            job["detached"] = bool(payload.get("detached"))
+    jobs = wrappers + collect_detached_jobs(wrappers)
     pods = collect_pods()
     pods_by_id = {pod["id"]: pod for pod in pods if pod["id"]}
     pods_by_name = {pod["name"]: pod for pod in pods if pod["name"]}
     matched_pod_ids: set[str] = set()
     active_jobs: list[dict[str, Any]] = []
-    for job in wrappers:
+    for job in jobs:
         pod = _match_pod(job, pods_by_id, pods_by_name)
         if pod and pod["id"]:
             matched_pod_ids.add(pod["id"])
@@ -683,9 +808,12 @@ def collect_dashboard_status(config: DashboardConfig) -> dict[str, Any]:
                 config.remote_timeout_seconds,
             )
             if remote is not None:
+                remote["subphase"] = _derive_remote_subphase(remote)
                 remote["phase"] = _derive_remote_phase(remote)
         local = _inspect_local_output(str(job.get("local_output") or ""), str(job.get("run_mode") or ""))
         phase = _derive_phase(job, remote, local)
+        if phase == "complete" and not job.get("pid") and not (pod and pod.get("id")):
+            continue
         active_jobs.append(
             {
                 **job,

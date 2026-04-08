@@ -17,6 +17,15 @@ def test_generate_b2_contains_control_flow_and_positive_header() -> None:
     assert "if_goto" in infer_features(program)
 
 
+def test_generate_b2_has_large_alpha_unique_space() -> None:
+    alpha_sources = {
+        alpha_normalize_source(render_program(generate_band_program("B2", seed=seed)))
+        for seed in range(1, 201)
+    }
+
+    assert len(alpha_sources) >= 180
+
+
 def test_generate_b3_contains_iteration_and_indexed_features() -> None:
     program = generate_band_program("B3", seed=11)
 
@@ -34,4 +43,4 @@ def test_generate_b3_has_large_alpha_unique_space() -> None:
         for seed in range(1, 201)
     }
 
-    assert len(alpha_sources) >= 150
+    assert len(alpha_sources) >= 180
