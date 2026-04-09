@@ -5,6 +5,7 @@ from ibm650_it.training.infer import (
     _generate_with_hf_model,
     _hf_inference_runtime,
     extract_thinking_trace,
+    normalize_completion_text,
 )
 
 
@@ -189,6 +190,53 @@ def test_should_attempt_assembly_skips_obvious_it_echo() -> None:
         ],
         exact_match=False,
     ) is False
+
+
+_FIRST_CARD_INDENT = " " * 42
+
+
+def test_normalize_completion_text_preserves_first_card_indent_when_closed() -> None:
+    body = (
+        f"{_FIRST_CARD_INDENT}s0001 00 0000 laaaa\n"
+        f"{_FIRST_CARD_INDENT}laaaarala0007       i1 z 3\n"
+        f"{_FIRST_CARD_INDENT}3         i0002  0002"
+    )
+    completion = f"<PIT>\n{body}\n</PIT>"
+
+    normalized = normalize_completion_text(completion)
+
+    assert normalized == body
+    assert normalized.startswith(_FIRST_CARD_INDENT + "s0001")
+
+
+def test_normalize_completion_text_preserves_first_card_indent_on_truncated_completion() -> None:
+    # Model ran out of new_tokens before emitting </PIT>. The prior implementation
+    # called .strip() on the leftover, which ate the 42-space indent on the very
+    # first dictionary card and broke SOAP column alignment at runtime.
+    body_truncated = (
+        f"{_FIRST_CARD_INDENT}s0001 00 0000 laaaa\n"
+        f"{_FIRST_CARD_INDENT}laaaarala0007       i1 z 3\n"
+        f"{_FIRST_CARD_INDENT}3         i0002"  # cut mid-card, no closing </PIT>
+    )
+    completion = f"<PIT>\n{body_truncated}"
+
+    normalized = normalize_completion_text(completion)
+
+    assert normalized.startswith(_FIRST_CARD_INDENT + "s0001 00 0000 laaaa")
+    assert not normalized.startswith("s0001"), "leading indent must not be stripped on truncated output"
+    assert "<PIT>" not in normalized
+
+
+def test_normalize_completion_text_handles_truncated_completion_with_multiple_leading_newlines() -> None:
+    body_truncated = (
+        f"{_FIRST_CARD_INDENT}s0001 00 0000 laaaa\n"
+        f"{_FIRST_CARD_INDENT}laaaarala0007       i1 z 3"
+    )
+    completion = f"<PIT>\n\n{body_truncated}"
+
+    normalized = normalize_completion_text(completion)
+
+    assert normalized.startswith(_FIRST_CARD_INDENT + "s0001 00 0000 laaaa")
 
 
 def test_should_attempt_assembly_keeps_symbolic_like_outputs() -> None:

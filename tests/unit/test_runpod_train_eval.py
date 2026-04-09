@@ -13,7 +13,7 @@ def test_real_baseline_defaults_are_frozen() -> None:
     assert runpod_train_eval.REAL_BASELINE_QLORA_BITS == 0
     assert runpod_train_eval.REAL_BASELINE_LEARNING_RATE == 2e-4
     assert runpod_train_eval.REAL_BASELINE_EPOCHS == 5
-    assert runpod_train_eval.REAL_BASELINE_MAX_NEW_TOKENS == 1024
+    assert runpod_train_eval.REAL_BASELINE_MAX_NEW_TOKENS == 1536
 
 
 def test_remote_train_command_uses_no_same_owner() -> None:

@@ -214,7 +214,7 @@ def main() -> None:
     parser.add_argument("--eval-split", default="synthetic_dev.jsonl")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--max-examples", type=int)
-    parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--max-new-tokens", type=int, default=1536)
     parser.add_argument("--failure-archive-limit", type=int, default=25)
     parser.add_argument("--step-budget", default="50M")
     parser.add_argument("--timeout-seconds", type=int, default=30)

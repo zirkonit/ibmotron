@@ -45,7 +45,10 @@ COLLECT_WATCHER_LOG_FILENAME = ".runpod_collect_watcher.log"
 REAL_BASELINE_QLORA_BITS = 0
 REAL_BASELINE_LEARNING_RATE = 2e-4
 REAL_BASELINE_EPOCHS = 5
-REAL_BASELINE_MAX_NEW_TOKENS = 1024
+# stage_2k reference PIT decks are 480–1154 tokens (A40 Nemotron-3-Nano-4B tokenizer);
+# B2/B3 all exceed 1024, so every prior run clipped the dictionary tail and forced
+# the normalizer onto the truncated-completion fallback path. 1536 leaves ~33% headroom.
+REAL_BASELINE_MAX_NEW_TOKENS = 1536
 
 
 REMOTE_BASE_INCLUDE_PATHS = [

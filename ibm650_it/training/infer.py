@@ -42,7 +42,11 @@ def normalize_completion_text(completion: str) -> str:
     if match:
         completion = match.group(1)
     elif completion.startswith("<PIT>"):
-        completion = completion.removeprefix("<PIT>").strip()
+        # Generation was truncated before </PIT>. Strip the opening tag and
+        # the single newline that follows it, but preserve leading whitespace
+        # on the first PIT card — dictionary cards depend on column alignment
+        # and the reference deck starts with ~42 spaces of indent.
+        completion = completion.removeprefix("<PIT>").lstrip("\n")
     if "</PIT>" in completion:
         completion = completion.split("</PIT>", 1)[0]
     return completion.strip("\n")
@@ -199,7 +203,7 @@ def _generate_with_hf_model(
     *,
     prompt: str | None,
     session: HfGenerationSession,
-    max_new_tokens: int = 1024,
+    max_new_tokens: int = 1536,
     prompt_input_ids: Any | None = None,
 ) -> str:
     stopping_criteria = None
@@ -382,7 +386,7 @@ def run_inference(
     support_sft: Path | None = None,
     few_shot_k: int = 4,
     limit: int | None = None,
-    max_new_tokens: int = 1024,
+    max_new_tokens: int = 1536,
     prompt_style: str = "plain",
     enable_thinking: bool | None = None,
     preserve_raw_completion: bool = False,
