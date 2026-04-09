@@ -1,11 +1,14 @@
 from ibm650_it.eval.failure_taxonomy import should_attempt_assembly
 from ibm650_it.training.infer import (
     HfGenerationSession,
+    PreflightTokenBudgetReport,
     StopOnTokenSequence,
     _generate_with_hf_model,
     _hf_inference_runtime,
+    _log_preflight_report,
     extract_thinking_trace,
     normalize_completion_text,
+    preflight_token_budget,
 )
 
 
@@ -179,6 +182,37 @@ def test_stop_on_token_sequence_accepts_multiple_variants() -> None:
     assert criteria(MatchingLongTailIds(), None) is True
 
 
+class _FakeBatchRow(list):
+    def tolist(self) -> list[int]:
+        return list(self)
+
+
+class _FakeBatchIds:
+    """Shape-aware 2-D tensor stub for StopOnTokenSequence batch tests."""
+
+    def __init__(self, rows: list[list[int]]):
+        self._rows = [_FakeBatchRow(row) for row in rows]
+        self.shape = (len(rows), max(len(row) for row in rows) if rows else 0)
+
+    def __getitem__(self, idx: int) -> _FakeBatchRow:
+        return self._rows[idx]
+
+
+def test_stop_on_token_sequence_waits_for_all_batch_rows_to_hit_stop() -> None:
+    criteria = StopOnTokenSequence([[10, 11, 12]])
+
+    # Row 0 has the stop tail, row 1 does not. The batched criterion should NOT
+    # stop yet — otherwise we'd prematurely cut row 1's generation off and the
+    # batched path would produce broken predictions for any sequence that isn't
+    # the fastest in the batch.
+    mixed = _FakeBatchIds([[9, 10, 11, 12], [0, 1, 2, 3]])
+    assert criteria(mixed, None) is False
+
+    # All rows hit the stop tail → stop.
+    all_hit = _FakeBatchIds([[9, 10, 11, 12], [0, 10, 11, 12]])
+    assert criteria(all_hit, None) is True
+
+
 def test_should_attempt_assembly_skips_obvious_it_echo() -> None:
     assert should_attempt_assembly(
         [
@@ -237,6 +271,72 @@ def test_normalize_completion_text_handles_truncated_completion_with_multiple_le
     normalized = normalize_completion_text(completion)
 
     assert normalized.startswith(_FIRST_CARD_INDENT + "s0001 00 0000 laaaa")
+
+
+def test_preflight_token_budget_reports_ok_when_all_under_cap() -> None:
+    report = preflight_token_budget(
+        reference_tokens=[("b0-1", 480), ("b0-2", 692), ("b1-1", 1005)],
+        max_new_tokens=1536,
+    )
+    assert report.ok is True
+    assert report.over_budget == []
+    assert report.largest_ref_tokens == 1005
+    assert report.sample_size == 3
+
+
+def test_preflight_token_budget_flags_over_budget_cases() -> None:
+    # Reproduces the 20260406 stage_2k distribution: B0 fits, B2/B3 exceed 1024
+    report = preflight_token_budget(
+        reference_tokens=[
+            ("b0", 600),
+            ("b1-small", 970),
+            ("b1-big", 1030),
+            ("b2", 1050),
+            ("b3", 1154),
+        ],
+        max_new_tokens=1024,
+    )
+    assert report.ok is False
+    assert report.over_budget_count == 3
+    assert report.largest_ref_tokens == 1154
+    assert {rid for rid, _ in report.over_budget} == {"b1-big", "b2", "b3"}
+
+
+def test_preflight_token_budget_empty_sample_is_ok() -> None:
+    report = preflight_token_budget(reference_tokens=[], max_new_tokens=1536)
+    assert report.ok is True
+    assert report.sample_size == 0
+    assert report.largest_ref_tokens == 0
+
+
+def test_log_preflight_report_ok_path(capsys) -> None:
+    report = PreflightTokenBudgetReport(
+        max_new_tokens=1536,
+        sample_size=10,
+        over_budget=[],
+        largest_ref_tokens=1200,
+    )
+    _log_preflight_report(report)
+    err = capsys.readouterr().err
+    assert "ok" in err
+    assert "1536" in err
+    assert "1200" in err
+
+
+def test_log_preflight_report_warn_path_names_offenders(capsys) -> None:
+    report = PreflightTokenBudgetReport(
+        max_new_tokens=1024,
+        sample_size=5,
+        over_budget=[("b2-a", 1050), ("b2-b", 1049), ("b3-a", 1154)],
+        largest_ref_tokens=1154,
+    )
+    _log_preflight_report(report)
+    err = capsys.readouterr().err
+    assert "WARN" in err
+    assert "3/5" in err
+    assert "b2-a:1050" in err
+    assert "1154" in err
+    assert "truncated" in err
 
 
 def test_should_attempt_assembly_keeps_symbolic_like_outputs() -> None:

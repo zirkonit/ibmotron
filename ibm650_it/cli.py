@@ -211,6 +211,7 @@ def cmd_run_inference(args: argparse.Namespace) -> None:
         step_budget=args.step_budget,
         timeout_seconds=args.timeout_seconds,
         eval_mode=args.eval_mode,
+        inference_batch_size=getattr(args, "inference_batch_size", 1),
     )
     _print_json(summary)
 
@@ -378,6 +379,7 @@ def cmd_train_eval(args: argparse.Namespace) -> None:
             step_budget=args.step_budget,
             timeout_seconds=args.timeout_seconds,
             eval_mode=args.eval_mode,
+            inference_batch_size=getattr(args, "inference_batch_size", 1),
         )
         results["evaluations"][mode] = {
             "prediction_index": inference_summary["prediction_index"],
@@ -438,6 +440,7 @@ def cmd_overfit_sanity(args: argparse.Namespace) -> None:
         step_budget=args.step_budget,
         timeout_seconds=args.timeout_seconds,
         eval_mode=args.eval_mode,
+        inference_batch_size=getattr(args, "inference_batch_size", 1),
     )
     summary = {
         "records_written": records_written,
@@ -588,7 +591,14 @@ def build_parser() -> argparse.ArgumentParser:
     infer.add_argument("--support-sft")
     infer.add_argument("--few-shot-k", type=int, default=4)
     infer.add_argument("--limit", type=int)
-    infer.add_argument("--max-new-tokens", type=int, default=1024)
+    infer.add_argument("--max-new-tokens", type=int, default=1536)
+    infer.add_argument(
+        "--inference-batch-size",
+        type=int,
+        default=1,
+        help="Batch size for hf_session-backed greedy generation. 1 = serial (default), "
+             ">1 batches prompts into a single model.generate() call for throughput.",
+    )
     infer.add_argument("--prompt-style", choices=["plain", "chat"], default="plain")
     infer.add_argument("--enable-thinking", dest="enable_thinking", action="store_true")
     infer.add_argument("--disable-thinking", dest="enable_thinking", action="store_false")
@@ -604,7 +614,7 @@ def build_parser() -> argparse.ArgumentParser:
     thinking.add_argument("--model", required=True)
     thinking.add_argument("--output", required=True)
     thinking.add_argument("--limit", type=int)
-    thinking.add_argument("--max-new-tokens", type=int, default=1024)
+    thinking.add_argument("--max-new-tokens", type=int, default=1536)
     thinking.add_argument("--eval-mode", choices=["inline", "skip"], default="inline")
     thinking.add_argument("--failure-archive-limit", type=int, default=25)
     thinking.add_argument("--step-budget", default="50M")
@@ -694,7 +704,8 @@ def build_parser() -> argparse.ArgumentParser:
     train_eval.add_argument("--band-repeat", action="append", default=[])
     train_eval.add_argument("--limit", type=int)
     train_eval.add_argument("--max-examples", type=int)
-    train_eval.add_argument("--max-new-tokens", type=int, default=1024)
+    train_eval.add_argument("--max-new-tokens", type=int, default=1536)
+    train_eval.add_argument("--inference-batch-size", type=int, default=1)
     train_eval.add_argument("--eval-mode", choices=["inline", "skip"], default="inline")
     train_eval.add_argument("--failure-archive-limit", type=int, default=25)
     train_eval.add_argument("--step-budget", default="50M")
@@ -710,7 +721,8 @@ def build_parser() -> argparse.ArgumentParser:
     smoke_train.add_argument("--band-repeat", action="append", default=[])
     smoke_train.add_argument("--limit", type=int)
     smoke_train.add_argument("--max-examples", type=int)
-    smoke_train.add_argument("--max-new-tokens", type=int, default=1024)
+    smoke_train.add_argument("--max-new-tokens", type=int, default=1536)
+    smoke_train.add_argument("--inference-batch-size", type=int, default=1)
     smoke_train.add_argument("--eval-mode", choices=["inline", "skip"], default="inline")
     smoke_train.add_argument("--failure-archive-limit", type=int, default=25)
     smoke_train.add_argument("--step-budget", default="50M")
@@ -740,7 +752,8 @@ def build_parser() -> argparse.ArgumentParser:
     overfit.add_argument("--per-device-train-batch-size", type=int, default=1)
     overfit.add_argument("--gradient-accumulation-steps", type=int, default=8)
     overfit.add_argument("--band-repeat", action="append", default=[])
-    overfit.add_argument("--max-new-tokens", type=int, default=1024)
+    overfit.add_argument("--max-new-tokens", type=int, default=1536)
+    overfit.add_argument("--inference-batch-size", type=int, default=1)
     overfit.add_argument("--eval-mode", choices=["inline", "skip"], default="inline")
     overfit.add_argument("--failure-archive-limit", type=int, default=25)
     overfit.add_argument("--step-budget", default="50M")

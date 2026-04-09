@@ -5,6 +5,9 @@ import json
 import subprocess
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from scripts import runpod_train_eval
 
@@ -123,6 +126,71 @@ def test_remote_overfit_command_uses_overfit_sanity() -> None:
     assert "--dataset-index artifacts/datasets/pilot_remote_128_20/splits/synthetic_train.jsonl" in command
     assert "--example-count 32" in command
     assert "--eval-mode skip" in command
+
+
+def test_remote_train_command_forwards_inference_batch_size_when_set() -> None:
+    args = argparse.Namespace(
+        run_mode="train-eval",
+        dataset_name="stage_2k",
+        dataset_index=None,
+        backend="transformers_qlora",
+        model_name="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
+        qlora_bits=0,
+        learning_rate=5e-4,
+        epochs=5,
+        max_seq_length=4096,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
+        few_shot_k=4,
+        train_split="synthetic_train.jsonl",
+        eval_split="synthetic_dev.jsonl",
+        limit=200,
+        max_examples=1600,
+        max_new_tokens=1536,
+        inference_batch_size=4,
+        failure_archive_limit=25,
+        step_budget="50M",
+        timeout_seconds=30,
+        example_count=32,
+    )
+
+    command = runpod_train_eval.remote_train_command(args, "artifacts/eval_reports/out", reuse_workspace=True)
+
+    assert "--inference-batch-size 4" in command
+    assert "--max-new-tokens 1536" in command
+
+
+def test_remote_train_command_omits_inference_batch_size_flag_when_one() -> None:
+    args = argparse.Namespace(
+        run_mode="train-eval",
+        dataset_name="stage_2k",
+        dataset_index=None,
+        backend="transformers_qlora",
+        model_name="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
+        qlora_bits=0,
+        learning_rate=5e-4,
+        epochs=5,
+        max_seq_length=4096,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
+        few_shot_k=4,
+        train_split="synthetic_train.jsonl",
+        eval_split="synthetic_dev.jsonl",
+        limit=200,
+        max_examples=1600,
+        max_new_tokens=1536,
+        inference_batch_size=1,
+        failure_archive_limit=25,
+        step_budget="50M",
+        timeout_seconds=30,
+        example_count=32,
+    )
+
+    command = runpod_train_eval.remote_train_command(args, "artifacts/eval_reports/out", reuse_workspace=True)
+
+    # Omit the flag entirely when batch_size is 1 so we don't churn the remote
+    # command fingerprint for existing resumable runs.
+    assert "--inference-batch-size" not in command
 
 
 def test_remote_inference_only_command_resumes_fine_tuned_predictions() -> None:
@@ -338,3 +406,170 @@ def test_collect_remote_dataset_repo_paths_keeps_only_split_and_training_targets
     assert "artifacts/datasets/mini/accepted/B0/0001_000001/source.it" in rel_paths
     assert "artifacts/datasets/mini/accepted/B0/0001_000001/pipeline/translate/pit_raw_canonical.dck" in rel_paths
     assert "artifacts/datasets/mini/accepted/B0/0001_000001/pipeline/run/spit_p1.dck" not in rel_paths
+
+
+@pytest.mark.parametrize(
+    "keep_pod,pod_id,detach_remote,expected",
+    [
+        (False, None, False, True),   # default: fresh pod, we own it, delete on exit
+        (True, None, False, False),   # --keep-pod: caller asked us to keep it
+        (False, "pod-abc", False, False),   # --pod-id: reusing existing pod, not ours
+        (False, None, True, False),   # --detach-remote: watcher will collect + delete
+        (True, "pod-abc", False, False),    # --keep-pod trumps --pod-id (belt and braces)
+        (True, None, True, False),    # --keep-pod with --detach-remote
+    ],
+)
+def test_initial_delete_pod_on_exit_honors_lifecycle_flags(keep_pod, pod_id, detach_remote, expected):
+    args = argparse.Namespace(keep_pod=keep_pod, pod_id=pod_id, detach_remote=detach_remote)
+    assert runpod_train_eval._initial_delete_pod_on_exit(args) is expected
+
+
+def _make_main_args(tmp_path: Path, **overrides) -> list[str]:
+    """Build a --local-output-only argv so main() stays inside tmp_path for side effects."""
+    base = [
+        "--name", "test-cleanup",
+        "--run-mode", "train-eval",
+        "--dataset-name", "mini",
+        "--gpu-id", "NVIDIA A40",
+        "--cloud-type", "SECURE",
+        "--remote-output", "artifacts/eval_reports/test-cleanup",
+        "--local-output", "artifacts/eval_reports/test-cleanup",
+    ]
+    for key, value in overrides.items():
+        base.extend([f"--{key}", str(value)])
+    return base
+
+
+class _FakeCtl:
+    """Minimal RunpodCtl stand-in that tracks delete_pod calls."""
+
+    def __init__(self, *, repo_root=None, ssh_returncode: int = 0, raise_on: str | None = None):
+        self.repo_root = repo_root
+        self.ssh_returncode = ssh_returncode
+        self.raise_on = raise_on
+        self.delete_calls: list[str] = []
+        self.created: list[dict[str, object]] = []
+
+    def ensure_ssh_key(self, **_kwargs):
+        return {}
+
+    def create_pod(self, *, name, gpu_id, image, cloud_type, public_ip):
+        pod = {"id": "pod-fake", "name": name, "desiredStatus": "RUNNING"}
+        self.created.append(pod)
+        return pod
+
+    def get_pod(self, pod_id):
+        return {"id": pod_id, "desiredStatus": "RUNNING"}
+
+    def wait_for_ssh(self, pod_id, **kwargs):
+        if self.raise_on == "wait_for_ssh":
+            raise RuntimeError("ssh never came up")
+        return {"id": pod_id, "ip": "1.2.3.4", "port": 22}
+
+    def scp_to(self, ssh_info, src, dst):
+        if self.raise_on == "scp_to":
+            raise RuntimeError("scp failed")
+
+    def scp_from(self, ssh_info, src, dst):
+        pass
+
+    def ssh(self, ssh_info, command, check=False):
+        if self.raise_on == "ssh":
+            raise RuntimeError("ssh blew up")
+        return SimpleNamespace(returncode=self.ssh_returncode, stdout="", stderr="")
+
+    def delete_pod(self, pod_id):
+        self.delete_calls.append(pod_id)
+
+
+def _install_fake_main_deps(monkeypatch, tmp_path: Path, *, fake_ctl: _FakeCtl, remote_output_exists: bool = True):
+    """Wire _FakeCtl + fake archives + fake sync/finalize into scripts.runpod_train_eval."""
+    monkeypatch.setattr(runpod_train_eval, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(runpod_train_eval, "RunpodCtl", lambda **kwargs: fake_ctl)
+    # Seed a minimal dataset so resolve_dataset_caps() can count records for the
+    # default --run-mode train-eval path without hitting the real filesystem.
+    splits = tmp_path / "artifacts" / "datasets" / "mini" / "splits"
+    splits.mkdir(parents=True)
+    (splits / "synthetic_train.jsonl").write_text("{}\n" * 4, encoding="utf-8")
+    (splits / "synthetic_dev.jsonl").write_text("{}\n" * 2, encoding="utf-8")
+    fake_base = tmp_path / "base.tgz"
+    fake_dataset = tmp_path / "dataset.tgz"
+    fake_base.write_bytes(b"")
+    fake_dataset.write_bytes(b"")
+    monkeypatch.setattr(runpod_train_eval, "build_base_archive", lambda: fake_base)
+    monkeypatch.setattr(runpod_train_eval, "build_dataset_archive", lambda args: fake_dataset)
+    monkeypatch.setattr(runpod_train_eval, "_sync_remote_output", lambda ctl, ssh_info, remote, local: None)
+    monkeypatch.setattr(runpod_train_eval, "_finalize_local_output", lambda args, local: {"ok": True})
+    # _remote_job_status/_launch_detached_remote_job only touch the pod for other paths
+    # The ssh test -e check inside train-eval main relies on ctl.ssh returning 0 for "test -e" — our
+    # FakeCtl's ssh returns ssh_returncode for every call regardless of the command. For the "remote
+    # output present" branch we need the `test -e` call to return 0 even when the main train ssh
+    # returned non-zero. Patch ctl.ssh with a smarter shim.
+    real_ssh = fake_ctl.ssh
+
+    def _patched_ssh(ssh_info, command, check=False):
+        if "test -e" in command:
+            return SimpleNamespace(returncode=0 if remote_output_exists else 1, stdout="", stderr="")
+        return real_ssh(ssh_info, command, check=check)
+
+    monkeypatch.setattr(fake_ctl, "ssh", _patched_ssh)
+
+
+def test_main_deletes_pod_even_when_ssh_returncode_nonzero(tmp_path: Path, monkeypatch):
+    """Reproduce the 20260408 failure mode: ssh drops mid-run, proc.returncode = 255,
+    remote output is still on the pod. Pre-fix main() leaked the pod because it
+    raised SystemExit before flipping delete_pod_on_exit. Post-fix the flag is set
+    up-front and the finally block tears the pod down."""
+    fake_ctl = _FakeCtl(ssh_returncode=255)
+    _install_fake_main_deps(monkeypatch, tmp_path, fake_ctl=fake_ctl)
+
+    argv = ["runpod_train_eval.py", *_make_main_args(tmp_path)]
+    monkeypatch.setattr("sys.argv", argv)
+
+    with pytest.raises(SystemExit) as excinfo:
+        runpod_train_eval.main()
+
+    assert excinfo.value.code == 255
+    assert fake_ctl.delete_calls == ["pod-fake"]
+
+
+def test_main_deletes_pod_when_sync_raises(tmp_path: Path, monkeypatch):
+    fake_ctl = _FakeCtl(ssh_returncode=0)
+    _install_fake_main_deps(monkeypatch, tmp_path, fake_ctl=fake_ctl)
+
+    def _exploding_sync(ctl, ssh_info, remote, local):
+        raise RuntimeError("scp_from blew up")
+
+    monkeypatch.setattr(runpod_train_eval, "_sync_remote_output", _exploding_sync)
+
+    argv = ["runpod_train_eval.py", *_make_main_args(tmp_path)]
+    monkeypatch.setattr("sys.argv", argv)
+
+    with pytest.raises(RuntimeError):
+        runpod_train_eval.main()
+
+    assert fake_ctl.delete_calls == ["pod-fake"]
+
+
+def test_main_does_not_delete_pod_when_keep_pod_set(tmp_path: Path, monkeypatch):
+    fake_ctl = _FakeCtl(ssh_returncode=0)
+    _install_fake_main_deps(monkeypatch, tmp_path, fake_ctl=fake_ctl)
+
+    argv = ["runpod_train_eval.py", *_make_main_args(tmp_path), "--keep-pod"]
+    monkeypatch.setattr("sys.argv", argv)
+
+    runpod_train_eval.main()
+
+    assert fake_ctl.delete_calls == []
+
+
+def test_main_does_not_delete_pod_when_reusing_pod_id(tmp_path: Path, monkeypatch):
+    fake_ctl = _FakeCtl(ssh_returncode=0)
+    _install_fake_main_deps(monkeypatch, tmp_path, fake_ctl=fake_ctl)
+
+    argv = ["runpod_train_eval.py", *_make_main_args(tmp_path), "--pod-id", "pod-preexisting"]
+    monkeypatch.setattr("sys.argv", argv)
+
+    runpod_train_eval.main()
+
+    assert fake_ctl.delete_calls == []

@@ -291,6 +291,8 @@ def remote_train_command(args: argparse.Namespace, remote_output: str, *, reuse_
     prefix = _base_runtime_steps() if reuse_workspace else [remote_prepare_command(), *_base_runtime_steps()]
     max_examples, limit = resolve_dataset_caps(args)
     band_repeat_flags = _band_repeat_flags(args)
+    batch_size = int(getattr(args, "inference_batch_size", 1) or 1)
+    batch_flag = f" --inference-batch-size {batch_size}" if batch_size > 1 else ""
     if args.run_mode == "overfit-sanity":
         dataset_index = args.dataset_index or f"artifacts/datasets/{args.dataset_name}/splits/synthetic_train.jsonl"
         return " && ".join(
@@ -310,8 +312,9 @@ def remote_train_command(args: argparse.Namespace, remote_output: str, *, reuse_
                     f"--per-device-train-batch-size {args.per_device_train_batch_size} "
                     f"--gradient-accumulation-steps {args.gradient_accumulation_steps} "
                     + (f"{band_repeat_flags} " if band_repeat_flags else "")
-                    + f"--max-new-tokens {args.max_new_tokens} "
-                    + "--eval-mode skip "
+                    + f"--max-new-tokens {args.max_new_tokens}"
+                    + batch_flag
+                    + " --eval-mode skip "
                     + f"--failure-archive-limit {args.failure_archive_limit} "
                     + f"--timeout-seconds {args.timeout_seconds}"
                 ).strip(),
@@ -330,8 +333,9 @@ def remote_train_command(args: argparse.Namespace, remote_output: str, *, reuse_
                     f"--mode {args.inference_mode} "
                     f"--model {model_path} "
                     + (f"--limit {limit} " if limit is not None else "")
-                    + f"--max-new-tokens {args.max_new_tokens} "
-                    + "--eval-mode skip "
+                    + f"--max-new-tokens {args.max_new_tokens}"
+                    + batch_flag
+                    + " --eval-mode skip "
                     f"--timeout-seconds {args.timeout_seconds}"
                 ).strip(),
             ]
@@ -355,8 +359,9 @@ def remote_train_command(args: argparse.Namespace, remote_output: str, *, reuse_
                 + (f"{band_repeat_flags} " if band_repeat_flags else "")
                 + (f"--limit {limit} " if limit is not None else "")
                 + (f"--max-examples {max_examples} " if max_examples is not None else "")
-                + f"--max-new-tokens {args.max_new_tokens} "
-                + "--eval-mode skip "
+                + f"--max-new-tokens {args.max_new_tokens}"
+                + batch_flag
+                + " --eval-mode skip "
                 + f"--failure-archive-limit {args.failure_archive_limit} "
                 + f"--timeout-seconds {args.timeout_seconds}"
             ).strip(),
@@ -526,6 +531,23 @@ def _launch_detached_remote_job(
         "remote_pid": job_pid,
         "remote_paths": remote_paths,
     }
+
+
+def _initial_delete_pod_on_exit(args: argparse.Namespace) -> bool:
+    """Decide whether a freshly-created pod should be torn down in the finally block.
+
+    The decision is pure args-based and made ONCE before any work happens, so that
+    any subsequent exception, SystemExit, SSH drop, sync error, or finalize error
+    still takes the pod down through the finally block. The prior logic only flipped
+    the flag at the very end of the happy path, which leaked pods on every non-zero
+    ssh returncode — the failure mode we hit in 20260408.
+
+    Returns False for modes where we want the pod to persist beyond this process:
+    - ``--pod-id``: we're reusing an existing pod, its lifecycle is not ours
+    - ``--keep-pod``: caller explicitly asked us to leave it running
+    - ``--detach-remote``: a watcher subprocess will handle collection and deletion
+    """
+    return not args.keep_pod and not args.pod_id and not args.detach_remote
 
 
 def _remote_job_status(ctl: RunpodCtl, ssh_info: dict[str, object], *, remote_output: str) -> dict[str, object]:
@@ -710,6 +732,14 @@ def main() -> None:
     parser.add_argument("--inference-mode", choices=["zero_shot", "few_shot", "fine_tuned"], default="fine_tuned")
     parser.add_argument("--model-path")
     parser.add_argument("--max-new-tokens", type=int, default=REAL_BASELINE_MAX_NEW_TOKENS)
+    parser.add_argument(
+        "--inference-batch-size",
+        type=int,
+        default=1,
+        help="Batch size passed to the remote run-inference / train-eval command. "
+             "1 is the historical serial default; set higher to batch model.generate() "
+             "calls and cut fine_tuned eval wall time.",
+    )
     parser.add_argument("--failure-archive-limit", type=int, default=25)
     parser.add_argument("--step-budget", default="50M")
     parser.add_argument("--timeout-seconds", type=int, default=30)
@@ -760,7 +790,10 @@ def main() -> None:
     else:
         pod = ctl.get_pod(args.pod_id)
     pod_id = pod["id"]
-    delete_pod_on_exit = False
+    # Set cleanup policy BEFORE anything can fail. The finally block will delete the
+    # pod unless the user opted out via --keep-pod/--pod-id/--detach-remote. The
+    # collect-only path overrides this after a successful collect.
+    delete_pod_on_exit = _initial_delete_pod_on_exit(args)
     try:
         ssh_info = ctl.wait_for_ssh(pod_id, timeout_seconds=600, poll_seconds=10)
         local_output_root = REPO_ROOT / args.local_output
@@ -880,9 +913,13 @@ def main() -> None:
         }
         print(json.dumps(summary, indent=2))
         if proc.returncode != 0:
+            # The sync + finalize ran successfully above even though ssh returned
+            # non-zero (e.g. the SSH session dropped mid-run but the remote job kept
+            # going and we synced its output on a later pass). Still surface the
+            # ssh returncode to the caller so CI sees the failure — delete_pod_on_exit
+            # was set at the top of the try block, so the finally block below will
+            # take the pod down regardless of this SystemExit.
             raise SystemExit(proc.returncode)
-        if not args.keep_pod and not args.pod_id and not args.detach_remote:
-            delete_pod_on_exit = True
     finally:
         if delete_pod_on_exit:
             try:

@@ -31,6 +31,23 @@ def _loop_bounds(rng: random.Random, *, start_hi: int = 3, step_hi: int = 2, ite
     return IntConst(start), IntConst(step), IntConst(stop)
 
 
+def _loop_bounds_wide(rng: random.Random) -> tuple[IntConst, IntConst, IntConst]:
+    """Wider iterate bounds that stress the model on larger symbol-table tails.
+
+    The 20260408 eval's only non-exact case was a B3 iterate where the model got
+    a single constant in the dictionary tail off by 1. The narrow _loop_bounds()
+    range (start 1-3, step 1-2, iterations 2-5) gives the model limited variety
+    on the iterate surface it sees during SFT; widening some families produces
+    PIT decks whose accumulator/constant positions vary more, which gives the
+    model more signal for generalising the symbol-table arithmetic.
+    """
+    start = rng.randint(1, 5)
+    step = rng.randint(1, 3)
+    iterations = rng.randint(3, 8)
+    stop = start + step * (iterations - 1)
+    return IntConst(start), IntConst(step), IntConst(stop)
+
+
 def _generate_b0(seed: int) -> Program:
     rng = random.Random(seed)
     assignment_count = rng.randint(1, 3)
@@ -136,8 +153,23 @@ def _generate_b2(seed: int) -> Program:
 
 def _generate_b3(seed: int) -> Program:
     rng = random.Random(seed)
-    start_expr, step_expr, stop_expr = _loop_bounds(rng)
-    family = rng.choice(["indexed_sum", "progressive_store", "postmix_store", "indexed_feedback", "indexed_pair_store"])
+    family = rng.choice(
+        [
+            "indexed_sum",
+            "progressive_store",
+            "postmix_store",
+            "indexed_feedback",
+            "indexed_pair_store",
+            # New families added 20260409 to widen the iterate surface distribution
+            # after the b23x/postfix run had a single B3 case miss exact match by
+            # one symbol-table constant.
+            "wide_indexed_sum",
+            "indexed_y_sum",
+            "dual_post_reduction",
+        ]
+    )
+    bounds_fn = _loop_bounds_wide if family in {"wide_indexed_sum", "indexed_y_sum", "dual_post_reduction"} else _loop_bounds
+    start_expr, step_expr, stop_expr = bounds_fn(rng)
 
     if family == "indexed_sum":
         base = rng.choice([FloatConst("0j"), _float_literal(rng), _float_literal(rng)])
@@ -196,7 +228,7 @@ def _generate_b3(seed: int) -> Program:
             Punch(9, (Var("y", IntConst(1)), Var("c", IntConst(1)), Var("c", IntConst(3)))),
             Halt(10),
         ]
-    else:
+    elif family == "indexed_pair_store":
         base = rng.choice([FloatConst("0j"), _float_literal(rng)])
         increment = _float_literal(rng)
         bias = _float_literal(rng)
@@ -210,6 +242,59 @@ def _generate_b3(seed: int) -> Program:
             Assign(7, Var("c", IntConst(2)), Add(Var("y", IntConst(1)), bias)),
             Punch(8, (Var("y", IntConst(1)), Var("c", IntConst(1)), Var("c", IntConst(2)))),
             Halt(9),
+        ]
+    elif family == "wide_indexed_sum":
+        # Same structural shape as the ff563f47 failing case (indexed_sum), but
+        # driven with wider loop bounds so each seed produces a different symbol-
+        # table tail length. The 20260408 miss was one constant off-by-one on a
+        # narrow-bounds (stop=5) instance; seeing wider bounds during SFT gives
+        # the model more signal to fit the constant arithmetic.
+        base = rng.choice([FloatConst("0j"), _float_literal(rng)])
+        increment = _float_literal(rng)
+        bias = _float_literal(rng)
+        statements = [
+            Assign(1, Var("y", IntConst(1)), base),
+            Iterate(2, 5, Var("i", IntConst(1)), start_expr, step_expr, stop_expr),
+            Assign(3, Var("c", Var("i", IntConst(1))), increment),
+            Assign(4, Var("y", IntConst(1)), Add(Var("y", IntConst(1)), Var("c", Var("i", IntConst(1))))),
+            Assign(5, Var("c", IntConst(1)), Add(Var("y", IntConst(1)), bias)),
+            Punch(6, (Var("y", IntConst(1)), Var("c", IntConst(1)))),
+            Halt(7),
+        ]
+    elif family == "indexed_y_sum":
+        # Mirror of indexed_sum using y-indexed instead of c-indexed so the model
+        # sees iterate loops that write into the y table as well. Prior B3 families
+        # were c-heavy; this rebalances the loop-body variable class.
+        base = rng.choice([FloatConst("0j"), _float_literal(rng)])
+        increment = _float_literal(rng)
+        bias = _float_literal(rng)
+        statements = [
+            Assign(1, Var("c", IntConst(1)), base),
+            Iterate(2, 5, Var("i", IntConst(1)), start_expr, step_expr, stop_expr),
+            Assign(3, Var("y", Var("i", IntConst(1))), increment),
+            Assign(4, Var("c", IntConst(1)), Add(Var("c", IntConst(1)), Var("y", Var("i", IntConst(1))))),
+            Assign(5, Var("y", IntConst(1)), Add(Var("c", IntConst(1)), bias)),
+            Punch(6, (Var("c", IntConst(1)), Var("y", IntConst(1)))),
+            Halt(7),
+        ]
+    else:  # dual_post_reduction
+        # Two sequential post-loop reductions instead of one. The dictionary tail
+        # is visibly longer on these, giving the model training pressure on the
+        # trailing cards that were the 20260406 per-card miss before the token-cap
+        # fix and the 20260408 off-by-one afterward.
+        base = rng.choice([FloatConst("0j"), _float_literal(rng)])
+        increment = _float_literal(rng)
+        bias_a = _float_literal(rng)
+        bias_b = _float_literal(rng)
+        statements = [
+            Assign(1, Var("y", IntConst(1)), base),
+            Iterate(2, 5, Var("i", IntConst(1)), start_expr, step_expr, stop_expr),
+            Assign(3, Var("c", Var("i", IntConst(1))), increment),
+            Assign(4, Var("y", IntConst(1)), Add(Var("y", IntConst(1)), Var("c", Var("i", IntConst(1))))),
+            Assign(5, Var("c", IntConst(1)), Add(Var("y", IntConst(1)), bias_a)),
+            Assign(6, Var("c", IntConst(2)), Add(Var("c", IntConst(1)), bias_b)),
+            Punch(7, (Var("y", IntConst(1)), Var("c", IntConst(1)), Var("c", IntConst(2)))),
+            Halt(8),
         ]
     program = Program(statements=tuple(statements))
     return Program(statements=program.statements, header=compute_header(program))
