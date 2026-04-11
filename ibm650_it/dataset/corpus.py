@@ -16,10 +16,12 @@ from ibm650_it.dataset.io import load_jsonl, relativize_record_paths, write_json
 from ibm650_it.dataset.provenance import build_provenance
 from ibm650_it.dataset.split import build_exact_splits, split_by_alpha_hash
 from ibm650_it.dataset.stages import stage_band_counts, stage_split_counts
-from ibm650_it.generate.sample_program import generate_band_program, infer_features
+from ibm650_it.generate.sample_program import generate_band_sample, infer_features, materialize_input_deck
 from ibm650_it.simh.runner import SimhRunner
 from ibm650_it.source.render_it_card80 import render_simh_source_deck
 from ibm650_it.source.render_it_text import render_program
+
+DEFAULT_PILOT_BAND_WEIGHTS = {"B0": 10, "B1": 25, "B2": 20, "B3": 20, "B4": 15, "B5": 10}
 
 
 def _remove_tree(path: Path) -> None:
@@ -39,7 +41,8 @@ def _build_candidate(
     if sample_dir.exists():
         shutil.rmtree(sample_dir)
     sample_dir.mkdir(parents=True, exist_ok=True)
-    program = generate_band_program(band, seed=seed)
+    generated = generate_band_sample(band, seed=seed)
+    program = generated.program
     source_path = sample_dir / "source.it"
     source_deck_path = sample_dir / "source.simh.txt"
     ast_path = sample_dir / "ast.json"
@@ -48,7 +51,12 @@ def _build_candidate(
     source_deck_path.write_text(render_simh_source_deck(program), encoding="utf-8")
     ast_path.write_text(json.dumps(asdict(program), indent=2), encoding="utf-8")
     bounds_path.write_text(json.dumps(asdict(program.header), indent=2), encoding="utf-8")
-    pipeline = runner.reference_pipeline(source_deck=source_deck_path, output_dir=sample_dir / "pipeline")
+    input_deck = materialize_input_deck(generated=generated, sample_dir=sample_dir, runner=runner)
+    pipeline = runner.reference_pipeline(
+        source_deck=source_deck_path,
+        output_dir=sample_dir / "pipeline",
+        input_deck=input_deck,
+    )
     record = build_record(
         band=band,
         seed=seed,
@@ -59,6 +67,7 @@ def _build_candidate(
         bounds_path=bounds_path,
         features=infer_features(program),
         repo_root=repo_root,
+        input_deck=input_deck,
     )
     return {
         "band": band,
@@ -68,10 +77,26 @@ def _build_candidate(
     }
 
 
+def _largest_remainder_counts(total: int, weights: dict[str, int]) -> dict[str, int]:
+    weight_total = sum(weights.values())
+    counts = {band: (total * weight) // weight_total for band, weight in weights.items()}
+    allocated = sum(counts.values())
+    remainders = sorted(
+        ((total * weight / weight_total - counts[band], band) for band, weight in weights.items()),
+        key=lambda item: (-item[0], item[1]),
+    )
+    remaining = total - allocated
+    for _, band in remainders:
+        if remaining <= 0:
+            break
+        counts[band] += 1
+        remaining -= 1
+    return counts
+
+
 def parse_band_counts(entries: list[str] | None, *, total_count: int = 1000) -> dict[str, int]:
     if not entries:
-        half = total_count // 2
-        return {"B0": half, "B1": total_count - half}
+        return _largest_remainder_counts(total_count, DEFAULT_PILOT_BAND_WEIGHTS)
     counts: dict[str, int] = {}
     for entry in entries:
         band, raw_count = entry.split(":", 1)

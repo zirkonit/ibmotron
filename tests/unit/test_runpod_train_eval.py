@@ -16,7 +16,7 @@ def test_real_baseline_defaults_are_frozen() -> None:
     assert runpod_train_eval.REAL_BASELINE_QLORA_BITS == 0
     assert runpod_train_eval.REAL_BASELINE_LEARNING_RATE == 2e-4
     assert runpod_train_eval.REAL_BASELINE_EPOCHS == 5
-    assert runpod_train_eval.REAL_BASELINE_MAX_NEW_TOKENS == 1536
+    assert runpod_train_eval.REAL_BASELINE_MAX_NEW_TOKENS == 2048
 
 
 def test_remote_train_command_uses_no_same_owner() -> None:
@@ -42,6 +42,7 @@ def test_remote_train_command_uses_no_same_owner() -> None:
         step_budget="50M",
         timeout_seconds=30,
         example_count=32,
+        band_repeat_preset="b45_focus",
         band_repeat=["B2=2", "B3=3"],
     )
     command = runpod_train_eval.remote_train_command(args, "artifacts/eval_reports/out")
@@ -49,7 +50,7 @@ def test_remote_train_command_uses_no_same_owner() -> None:
     assert "tar --no-same-owner --no-same-permissions -xzf /workspace/ibmotron-dataset.tgz -C /workspace" in command
     assert "./scripts/build_simh.sh" not in command
     assert "--eval-mode skip" in command
-    assert "--band-repeat B2=2 --band-repeat B3=3" in command
+    assert "--band-repeat-preset b45_focus --band-repeat B2=2 --band-repeat B3=3" in command
 
 
 def test_remote_prepare_command_bootstraps_runtime_only() -> None:
@@ -308,6 +309,52 @@ def test_watch_collect_marks_complete_when_summary_exists(tmp_path: Path, monkey
     assert rc == 0
     metadata = json.loads((output_root / runpod_train_eval.LOCAL_JOB_METADATA_FILENAME).read_text(encoding="utf-8"))
     assert metadata["status"] == "complete"
+
+
+def test_finalize_local_output_inference_only_finalizes_requested_mode(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(runpod_train_eval, "REPO_ROOT", tmp_path)
+
+    finalize_calls: list[dict[str, object]] = []
+
+    def fake_run(argv, cwd=None, check=None):
+        assert argv == ["./scripts/build_simh.sh"]
+        assert cwd == tmp_path
+        assert check is True
+        return SimpleNamespace(returncode=0)
+
+    def fake_finalize_train_eval_output(**kwargs):
+        finalize_calls.append(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(runpod_train_eval.subprocess, "run", fake_run)
+    monkeypatch.setattr(runpod_train_eval, "finalize_train_eval_output", fake_finalize_train_eval_output)
+
+    args = argparse.Namespace(
+        run_mode="inference-only",
+        dataset_name="stage_20k_repaired",
+        eval_split="synthetic_dev.jsonl",
+        inference_mode="fine_tuned",
+        failure_archive_limit=25,
+        step_budget="50M",
+        timeout_seconds=30,
+        dataset_index=None,
+    )
+
+    result = runpod_train_eval._finalize_local_output(args, tmp_path / "artifacts" / "eval_reports" / "out")
+
+    assert result == {"ok": True}
+    assert finalize_calls == [
+        {
+            "dataset_root": tmp_path / "artifacts" / "datasets" / "stage_20k_repaired",
+            "output_root": tmp_path / "artifacts" / "eval_reports" / "out",
+            "eval_split": "synthetic_dev.jsonl",
+            "modes": ["fine_tuned"],
+            "failure_archive_limit": 25,
+            "repo_root": tmp_path,
+            "step_budget": "50M",
+            "timeout_seconds": 30,
+        }
+    ]
 
 
 def test_remote_train_command_infers_full_split_sizes_when_caps_omitted(tmp_path: Path, monkeypatch) -> None:

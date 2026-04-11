@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 
 from ibm650_it.dataset.io import load_jsonl, write_jsonl
+from ibm650_it.dataset.sampling import stable_limit_records
 
 
 SPLIT_NAMES = [
@@ -84,7 +85,11 @@ def slice_dataset(
         else:
             limit = split_limits[split_name]
             if limit is not None:
-                records = records[:limit]
+                records = stable_limit_records(
+                    records,
+                    limit,
+                    salt=f"slice_dataset:{source_root}:{split_name}",
+                )
         rewritten = [_rewrite_record_paths(record, source_root=source_root) for record in records]
         selected_by_split[split_name] = rewritten
         for record in rewritten:

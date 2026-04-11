@@ -17,4 +17,6 @@ BANDS = {
     "B1": BandSpec("B1", 4, 8, False, False),
     "B2": BandSpec("B2", 4, 10, True, False),
     "B3": BandSpec("B3", 4, 10, True, True),
+    "B4": BandSpec("B4", 8, 20, True, True),
+    "B5": BandSpec("B5", 8, 20, True, True),
 }

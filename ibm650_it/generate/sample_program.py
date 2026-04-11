@@ -3,20 +3,31 @@ from __future__ import annotations
 import json
 import random
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from ibm650_it.dataset.build_records import build_record
 from ibm650_it.generate.bands import BANDS
 from ibm650_it.simh.runner import SimhRunner
-from ibm650_it.source.ast import Add, Assign, FloatConst, Goto, Halt, IfGoto, IntConst, Iterate, Mul, Program, Punch, Statement, Var
+from ibm650_it.source.ast import Add, Assign, FloatConst, Goto, Halt, IfGoto, IntConst, Iterate, Mul, Program, Punch, Read, Statement, Var
 from ibm650_it.source.render_it_card80 import render_simh_source_deck
 from ibm650_it.source.bounds import compute_header
 from ibm650_it.source.render_it_text import render_program
 
 
-def _float_literal(rng: random.Random) -> FloatConst:
-    return FloatConst(f"{rng.randint(1, 9)}j")
+@dataclass(frozen=True, slots=True)
+class GeneratedSample:
+    program: Program
+    input_program: Program | None = None
+
+
+def _finalize_program(statements: list[Statement]) -> Program:
+    program = Program(statements=tuple(statements))
+    return Program(statements=program.statements, header=compute_header(program))
+
+
+def _float_literal(rng: random.Random, *, hi: int = 9) -> FloatConst:
+    return FloatConst(f"{rng.randint(1, hi)}j")
 
 
 def _int_literal(rng: random.Random, lo: int = 1, hi: int = 6) -> IntConst:
@@ -51,16 +62,42 @@ def _loop_bounds_wide(rng: random.Random) -> tuple[IntConst, IntConst, IntConst]
 def _generate_b0(seed: int) -> Program:
     rng = random.Random(seed)
     assignment_count = rng.randint(1, 3)
-    statements = [Assign(1, Var("y", IntConst(1)), _float_literal(rng))]
-    if assignment_count >= 2:
-        statements.append(Assign(2, Var("c", IntConst(1)), Add(Var("y", IntConst(1)), _float_literal(rng))))
-    if assignment_count >= 3:
-        statements.append(Assign(3, Var("y", IntConst(2)), Add(Var("c", IntConst(1)), _float_literal(rng))))
-    punch_var = Var("y", IntConst(2 if assignment_count >= 3 else 1))
-    statements.append(Punch(len(statements) + 1, (punch_var,)))
+    family = rng.choice(["y_c_y", "c_y_c", "y_y_c"])
+    literal = lambda: _float_literal(rng, hi=9999)
+
+    if family == "y_c_y":
+        statements = [Assign(1, Var("y", IntConst(1)), literal())]
+        if assignment_count >= 2:
+            statements.append(Assign(2, Var("c", IntConst(1)), Add(Var("y", IntConst(1)), literal())))
+        if assignment_count >= 3:
+            statements.append(Assign(3, Var("y", IntConst(2)), Add(Var("c", IntConst(1)), literal())))
+        output_vars = (Var("y", IntConst(2 if assignment_count >= 3 else 1)),)
+    elif family == "c_y_c":
+        statements = [Assign(1, Var("c", IntConst(1)), literal())]
+        if assignment_count >= 2:
+            statements.append(Assign(2, Var("y", IntConst(1)), Add(Var("c", IntConst(1)), literal())))
+        if assignment_count >= 3:
+            statements.append(Assign(3, Var("c", IntConst(2)), Add(Var("y", IntConst(1)), literal())))
+        output_vars = (
+            (Var("c", IntConst(1)),)
+            if assignment_count == 1
+            else (Var("y", IntConst(1)), Var("c", IntConst(2 if assignment_count >= 3 else 1)))
+        )
+    else:  # y_y_c
+        statements = [Assign(1, Var("y", IntConst(1)), literal())]
+        if assignment_count >= 2:
+            statements.append(Assign(2, Var("y", IntConst(2)), Add(Var("y", IntConst(1)), literal())))
+        if assignment_count >= 3:
+            statements.append(Assign(3, Var("c", IntConst(1)), Add(Var("y", IntConst(2)), literal())))
+        output_vars = (
+            (Var("y", IntConst(1)),)
+            if assignment_count == 1
+            else (Var("y", IntConst(2)), Var("c", IntConst(1)) if assignment_count >= 3 else Var("y", IntConst(1)))
+        )
+
+    statements.append(Punch(len(statements) + 1, output_vars))
     statements.append(Halt(len(statements) + 1))
-    program = Program(statements=tuple(statements))
-    return Program(statements=program.statements, header=compute_header(program))
+    return _finalize_program(statements)
 
 
 def _generate_b1(seed: int) -> Program:
@@ -88,8 +125,7 @@ def _generate_b1(seed: int) -> Program:
 
     statements.append(Punch(next_stmt, tuple(output_vars[:4])))
     statements.append(Halt(next_stmt + 1))
-    program = Program(statements=tuple(statements))
-    return Program(statements=program.statements, header=compute_header(program))
+    return _finalize_program(statements)
 
 
 def _generate_b2(seed: int) -> Program:
@@ -147,8 +183,7 @@ def _generate_b2(seed: int) -> Program:
             Punch(13, (Var("i", IntConst(1)), Var("c", IntConst(2)), Var("y", IntConst(2)))),
             Halt(14),
         ]
-    program = Program(statements=tuple(statements))
-    return Program(statements=program.statements, header=compute_header(program))
+    return _finalize_program(statements)
 
 
 def _generate_b3(seed: int) -> Program:
@@ -296,22 +331,157 @@ def _generate_b3(seed: int) -> Program:
             Punch(7, (Var("y", IntConst(1)), Var("c", IntConst(1)), Var("c", IntConst(2)))),
             Halt(8),
         ]
-    program = Program(statements=tuple(statements))
-    return Program(statements=program.statements, header=compute_header(program))
+    return _finalize_program(statements)
 
 
-def generate_band_program(band: str, *, seed: int) -> Program:
+def _generate_b4(seed: int) -> Program:
+    rng = random.Random(seed)
+    family = rng.choice(["branched_index_accumulator", "prebranch_loop_feedback"])
+    start_expr, step_expr, stop_expr = _loop_bounds_wide(rng)
+
+    if family == "branched_index_accumulator":
+        base = rng.choice([FloatConst("0j"), _float_literal(rng)])
+        carry = _float_literal(rng)
+        increment = _float_literal(rng)
+        threshold = _float_literal(rng)
+        low_bonus = _float_literal(rng)
+        high_bonus = _float_literal(rng)
+        statements = [
+            Assign(1, Var("y", IntConst(1)), base),
+            Assign(2, Var("c", IntConst(1)), carry),
+            Assign(3, Var("y", IntConst(2)), FloatConst("0j")),
+            Iterate(4, 7, Var("i", IntConst(1)), start_expr, step_expr, stop_expr),
+            Assign(5, Var("c", Var("i", IntConst(1))), Add(Var("c", IntConst(1)), increment)),
+            Assign(6, Var("y", IntConst(2)), Add(Var("y", IntConst(2)), Var("c", Var("i", IntConst(1))))),
+            Assign(7, Var("y", IntConst(1)), Add(Var("y", IntConst(1)), Var("y", IntConst(2)))),
+            Assign(8, Var("c", IntConst(2)), Add(Var("y", IntConst(1)), Var("c", IntConst(1)))),
+            IfGoto(9, 12, Var("c", IntConst(2)), "w", threshold),
+            Assign(10, Var("y", IntConst(3)), Add(Var("c", IntConst(2)), low_bonus)),
+            Goto(11, 13),
+            Assign(12, Var("y", IntConst(3)), Add(Var("c", IntConst(2)), high_bonus)),
+            Punch(13, (Var("y", IntConst(2)), Var("c", IntConst(2)))),
+            Punch(14, (Var("y", IntConst(1)), Var("y", IntConst(3)))),
+            Halt(15),
+        ]
+        return _finalize_program(statements)
+
+    selector = _int_literal(rng, 1, 6)
+    pivot = _int_literal(rng, 2, 5)
+    low_seed = rng.choice([FloatConst("0j"), _float_literal(rng)])
+    high_seed = _float_literal(rng)
+    delta = _float_literal(rng)
+    tail = _float_literal(rng)
+    threshold = _float_literal(rng)
+    low_bonus = _float_literal(rng)
+    high_bonus = _float_literal(rng)
+    statements = [
+        Assign(1, Var("i", IntConst(1)), selector),
+        IfGoto(2, 5, Var("i", IntConst(1)), "w", pivot),
+        Assign(3, Var("y", IntConst(1)), low_seed),
+        Goto(4, 6),
+        Assign(5, Var("y", IntConst(1)), high_seed),
+        Assign(6, Var("c", IntConst(1)), delta),
+        Iterate(7, 10, Var("i", IntConst(2)), start_expr, step_expr, stop_expr),
+        Assign(8, Var("y", Var("i", IntConst(2))), Add(Var("y", IntConst(1)), Var("c", IntConst(1)))),
+        Assign(9, Var("c", IntConst(2)), Add(Var("y", Var("i", IntConst(2))), Var("y", IntConst(1)))),
+        Assign(10, Var("y", IntConst(1)), Add(Var("c", IntConst(2)), Var("c", IntConst(1)))),
+        Assign(11, Var("c", IntConst(3)), Add(Var("y", IntConst(1)), tail)),
+        IfGoto(12, 15, Var("c", IntConst(3)), "w", threshold),
+        Assign(13, Var("y", IntConst(2)), Add(Var("c", IntConst(3)), low_bonus)),
+        Goto(14, 16),
+        Assign(15, Var("y", IntConst(2)), Add(Var("c", IntConst(3)), high_bonus)),
+        Punch(16, (Var("y", IntConst(1)), Var("y", IntConst(2)))),
+        Punch(17, (Var("c", IntConst(1)), Var("c", IntConst(2)), Var("c", IntConst(3)))),
+        Halt(18),
+    ]
+    return _finalize_program(statements)
+
+
+def _build_input_program(bindings: list[tuple[Var, IntConst | FloatConst]]) -> Program:
+    statements: list[Statement] = []
+    next_stmt = 1
+    for var, expr in bindings:
+        statements.append(Assign(next_stmt, var, expr))
+        next_stmt += 1
+    statements.append(Punch(next_stmt, tuple(var for var, _ in bindings)))
+    statements.append(Halt(next_stmt + 1))
+    return _finalize_program(statements)
+
+
+def _generate_b5(seed: int) -> GeneratedSample:
+    rng = random.Random(seed)
+    input_bindings = [
+        (Var("y", IntConst(1)), rng.choice([FloatConst("0j"), _float_literal(rng)])),
+        (Var("c", IntConst(1)), _float_literal(rng)),
+        (Var("i", IntConst(1)), _int_literal(rng, 1, 6)),
+        (Var("y", IntConst(2)), _float_literal(rng)),
+    ]
+    input_program = _build_input_program(input_bindings)
+
+    family = rng.choice(["read_loop_branch_mix", "read_index_feedback"])
+    start_expr, step_expr, stop_expr = _loop_bounds_wide(rng)
+    threshold = _int_literal(rng, 2, 5)
+    low_bonus = _float_literal(rng)
+    high_bonus = _float_literal(rng)
+
+    if family == "read_loop_branch_mix":
+        statements = [
+            Read(1),
+            Assign(2, Var("y", IntConst(3)), Add(Var("y", IntConst(1)), Var("c", IntConst(1)))),
+            Assign(3, Var("c", IntConst(2)), Add(Var("y", IntConst(2)), Var("c", IntConst(1)))),
+            Iterate(4, 7, Var("i", IntConst(2)), start_expr, step_expr, stop_expr),
+            Assign(5, Var("c", IntConst(3)), Add(Var("c", IntConst(2)), Var("y", IntConst(3)))),
+            Assign(6, Var("y", IntConst(3)), Add(Var("y", IntConst(3)), Var("c", IntConst(3)))),
+            Assign(7, Var("c", IntConst(2)), Add(Var("c", IntConst(2)), Var("y", IntConst(2)))),
+            IfGoto(8, 11, Var("i", IntConst(1)), "w", threshold),
+            Assign(9, Var("y", IntConst(4)), Add(Var("y", IntConst(3)), low_bonus)),
+            Goto(10, 12),
+            Assign(11, Var("y", IntConst(4)), Add(Var("y", IntConst(3)), high_bonus)),
+            Punch(12, (Var("y", IntConst(4)), Var("c", IntConst(2)))),
+            Punch(13, (Var("i", IntConst(1)), Var("y", IntConst(2)))),
+            Halt(14),
+        ]
+        return GeneratedSample(program=_finalize_program(statements), input_program=input_program)
+
+    statements = [
+        Read(1),
+        Assign(2, Var("y", IntConst(3)), Var("y", IntConst(1))),
+        Assign(3, Var("c", IntConst(2)), Var("c", IntConst(1))),
+        Iterate(4, 7, Var("i", IntConst(2)), start_expr, step_expr, stop_expr),
+        Assign(5, Var("c", Var("i", IntConst(2))), Add(Var("c", IntConst(2)), Var("y", IntConst(2)))),
+        Assign(6, Var("y", IntConst(3)), Add(Var("y", IntConst(3)), Var("c", Var("i", IntConst(2))))),
+        Assign(7, Var("c", IntConst(2)), Add(Var("c", Var("i", IntConst(2))), Var("c", IntConst(1)))),
+        IfGoto(8, 11, Var("i", IntConst(1)), "w", threshold),
+        Assign(9, Var("y", IntConst(4)), Add(Var("y", IntConst(3)), low_bonus)),
+        Goto(10, 12),
+        Assign(11, Var("y", IntConst(4)), Add(Var("y", IntConst(3)), high_bonus)),
+        Punch(12, (Var("y", IntConst(3)), Var("y", IntConst(4)))),
+        Punch(13, (Var("c", IntConst(2)), Var("i", IntConst(1)))),
+        Halt(14),
+    ]
+    return GeneratedSample(program=_finalize_program(statements), input_program=input_program)
+
+
+def generate_band_sample(band: str, *, seed: int) -> GeneratedSample:
     if band not in BANDS:
         raise KeyError(f"unknown band: {band}")
     if band == "B0":
-        return _generate_b0(seed)
+        return GeneratedSample(program=_generate_b0(seed))
     if band == "B1":
-        return _generate_b1(seed)
+        return GeneratedSample(program=_generate_b1(seed))
     if band == "B2":
-        return _generate_b2(seed)
+        return GeneratedSample(program=_generate_b2(seed))
     if band == "B3":
-        return _generate_b3(seed)
+        return GeneratedSample(program=_generate_b3(seed))
+    if band == "B4":
+        return GeneratedSample(program=_generate_b4(seed))
+    if band == "B5":
+        return _generate_b5(seed)
     raise NotImplementedError(f"{band} generation is not implemented yet")
+
+
+def generate_band_program(band: str, *, seed: int) -> Program:
+    return generate_band_sample(band, seed=seed).program
 
 
 def _collect_var_features(expr: object, features: set[str]) -> None:
@@ -353,7 +523,41 @@ def infer_features(program: Program) -> list[str]:
             _collect_var_features(statement.start_expr, features)
             _collect_var_features(statement.step_expr, features)
             _collect_var_features(statement.stop_expr, features)
+        if isinstance(statement, Read):
+            features.add("read")
+            for var in statement.vars:
+                _collect_var_features(var, features)
     return sorted(features)
+
+
+def _write_program_artifacts(program: Program, sample_dir: Path, *, stem: str) -> tuple[Path, Path, Path, Path]:
+    source_path = sample_dir / f"{stem}.it"
+    source_deck_path = sample_dir / f"{stem}.simh.txt"
+    ast_path = sample_dir / f"{stem}.ast.json"
+    bounds_path = sample_dir / f"{stem}.bounds.json"
+    source_path.write_text(render_program(program), encoding="utf-8")
+    source_deck_path.write_text(render_simh_source_deck(program), encoding="utf-8")
+    ast_path.write_text(json.dumps(asdict(program), indent=2), encoding="utf-8")
+    bounds_path.write_text(json.dumps(asdict(program.header), indent=2), encoding="utf-8")
+    return source_path, source_deck_path, ast_path, bounds_path
+
+
+def materialize_input_deck(
+    *,
+    generated: GeneratedSample,
+    sample_dir: Path,
+    runner: SimhRunner,
+) -> Path | None:
+    if generated.input_program is None:
+        return None
+    _, source_deck_path, _, _ = _write_program_artifacts(generated.input_program, sample_dir, stem="input_source")
+    pipeline = runner.reference_pipeline(
+        source_deck=source_deck_path,
+        output_dir=sample_dir / "input_pipeline",
+    )
+    if pipeline.run.output_deck is None:
+        raise RuntimeError("input producer did not emit a run output deck")
+    return pipeline.run.output_deck
 
 
 def generate_accepted_programs(
@@ -380,19 +584,15 @@ def generate_accepted_programs(
         sample_id = f"{band.lower()}_{accepted + 1:04d}_seed{seed:06d}"
         sample_dir = output_dir / sample_id
         sample_dir.mkdir(parents=True, exist_ok=True)
-        program = generate_band_program(band, seed=seed)
-        source_path = sample_dir / "source.it"
-        source_deck_path = sample_dir / "source.simh.txt"
-        source_path.write_text(render_program(program), encoding="utf-8")
-        source_deck_path.write_text(render_simh_source_deck(program), encoding="utf-8")
-        ast_path = sample_dir / "ast.json"
-        bounds_path = sample_dir / "bounds.json"
-        ast_path.write_text(json.dumps(asdict(program), indent=2), encoding="utf-8")
-        bounds_path.write_text(json.dumps(asdict(program.header), indent=2), encoding="utf-8")
+        generated = generate_band_sample(band, seed=seed)
+        program = generated.program
+        source_path, source_deck_path, ast_path, bounds_path = _write_program_artifacts(program, sample_dir, stem="source")
         try:
+            input_deck = materialize_input_deck(generated=generated, sample_dir=sample_dir, runner=runner)
             pipeline = runner.reference_pipeline(
                 source_deck=source_deck_path,
                 output_dir=sample_dir / "pipeline",
+                input_deck=input_deck,
             )
         except Exception as exc:
             rejection_counts[type(exc).__name__] += 1
@@ -408,6 +608,7 @@ def generate_accepted_programs(
             ast_path=ast_path,
             bounds_path=bounds_path,
             features=infer_features(program),
+            input_deck=input_deck,
         )
         (sample_dir / "record.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
         with index_path.open("a", encoding="utf-8") as handle:

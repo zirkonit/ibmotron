@@ -57,6 +57,7 @@ def finalize_train_eval_output(
     dataset_root: Path,
     output_root: Path,
     eval_split: str = "synthetic_dev.jsonl",
+    modes: list[str] | None = None,
     failure_archive_limit: int = 25,
     repo_root: Path = REPO_ROOT,
     step_budget: str = "50M",
@@ -68,9 +69,10 @@ def finalize_train_eval_output(
         existing_summary_path = output_root / "summary.json"
         existing_summary = json.loads(existing_summary_path.read_text(encoding="utf-8")) if existing_summary_path.exists() else {}
 
+        requested_modes = modes or ["zero_shot", "few_shot", "fine_tuned"]
         evaluations: dict[str, Any] = {}
         reports: dict[str, dict[str, Any]] = {}
-        for mode in ["zero_shot", "few_shot", "fine_tuned"]:
+        for mode in requested_modes:
             session.write_state(status="running", current_mode=mode)
             mode_result = reevaluate_and_report_mode(
                 reference_index=eval_index,

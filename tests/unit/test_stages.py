@@ -41,7 +41,7 @@ def test_build_stage_corpus_forwards_stage_counts(monkeypatch, tmp_path: Path) -
 
 def test_build_exact_splits_respects_requested_counts() -> None:
     records = []
-    for band in ["B0", "B1", "B2", "B3"]:
+    for band in ["B0", "B1", "B2", "B3", "B4", "B5"]:
         for index in range(3):
             records.append(
                 {
@@ -54,12 +54,21 @@ def test_build_exact_splits_respects_requested_counts() -> None:
     buckets = build_exact_splits(
         records,
         split_counts={
-            "synthetic_train": 8,
-            "synthetic_dev": 2,
-            "synthetic_test": 2,
+            "synthetic_train": 12,
+            "synthetic_dev": 3,
+            "synthetic_test": 3,
         },
     )
 
-    assert len(buckets["synthetic_train"]) == 8
-    assert len(buckets["synthetic_dev"]) == 2
-    assert len(buckets["synthetic_test"]) == 2
+    assert len(buckets["synthetic_train"]) == 12
+    assert len(buckets["synthetic_dev"]) == 3
+    assert len(buckets["synthetic_test"]) == 3
+
+
+def test_parse_band_counts_defaults_cover_expanded_curriculum() -> None:
+    counts = corpus.parse_band_counts(None, total_count=1000)
+
+    assert sum(counts.values()) == 1000
+    assert set(counts) == {"B0", "B1", "B2", "B3", "B4", "B5"}
+    assert counts["B4"] > 0
+    assert counts["B5"] > 0

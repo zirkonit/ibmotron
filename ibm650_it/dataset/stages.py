@@ -22,21 +22,35 @@ STAGE_SPECS = {
         total_count=2000,
         dev_count=200,
         test_count=200,
-        band_weights={"B0": 20, "B1": 50, "B2": 20, "B3": 10},
+        band_weights={"B0": 10, "B1": 25, "B2": 20, "B3": 20, "B4": 15, "B5": 10},
     ),
     "5k": StageSpec(
         name="5k",
         total_count=5000,
         dev_count=500,
         test_count=500,
-        band_weights={"B0": 15, "B1": 45, "B2": 25, "B3": 15},
+        band_weights={"B0": 8, "B1": 22, "B2": 20, "B3": 20, "B4": 18, "B5": 12},
     ),
     "10k": StageSpec(
         name="10k",
         total_count=10000,
         dev_count=1000,
         test_count=1000,
-        band_weights={"B0": 10, "B1": 40, "B2": 30, "B3": 20},
+        band_weights={"B0": 5, "B1": 18, "B2": 20, "B3": 20, "B4": 22, "B5": 15},
+    ),
+    "20k": StageSpec(
+        name="20k",
+        total_count=20000,
+        dev_count=2000,
+        test_count=2000,
+        band_weights={"B0": 5, "B1": 15, "B2": 18, "B3": 20, "B4": 25, "B5": 17},
+    ),
+    "25k": StageSpec(
+        name="25k",
+        total_count=25000,
+        dev_count=2500,
+        test_count=2500,
+        band_weights={"B0": 4, "B1": 14, "B2": 18, "B3": 20, "B4": 26, "B5": 18},
     ),
 }
 

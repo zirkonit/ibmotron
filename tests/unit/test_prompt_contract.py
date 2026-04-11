@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from ibm650_it.eval.failure_taxonomy import classify_failure
-from ibm650_it.training.prepare_sft import parse_band_repeats, prepare_sft_examples
+from ibm650_it.training.prepare_sft import parse_band_repeats, prepare_sft_examples, resolve_band_repeats
 from ibm650_it.training.prompt_templates import (
     build_chat_messages,
     build_few_shot_chat_messages,
@@ -119,8 +119,53 @@ def test_prepare_sft_examples_can_oversample_selected_bands(tmp_path: Path) -> N
     assert '"repeat_index": 2' in rows[2]
 
 
+def test_prepare_sft_examples_limit_is_band_balanced_on_ordered_index(tmp_path: Path) -> None:
+    target = tmp_path / "target.dck"
+    target.write_text("card-1\n", encoding="latin-1")
+    source = tmp_path / "source.it"
+    source.write_text("+ 0 1 0 3 1730\n0001+ y1 z 2j f\n0002+ t y1 f\n0003+ h ff\n", encoding="utf-8")
+    index = tmp_path / "index.jsonl"
+    index.write_text(
+        "\n".join(
+            [
+                '{"id":"b0_a","band":"B0","source":{"it_text_v1":"source.it"},'
+                '"reference":{"translate":{"pit_raw_canonical":"target.dck"}}}',
+                '{"id":"b0_b","band":"B0","source":{"it_text_v1":"source.it"},'
+                '"reference":{"translate":{"pit_raw_canonical":"target.dck"}}}',
+                '{"id":"b1_a","band":"B1","source":{"it_text_v1":"source.it"},'
+                '"reference":{"translate":{"pit_raw_canonical":"target.dck"}}}',
+                '{"id":"b1_b","band":"B1","source":{"it_text_v1":"source.it"},'
+                '"reference":{"translate":{"pit_raw_canonical":"target.dck"}}}',
+                '{"id":"b2_a","band":"B2","source":{"it_text_v1":"source.it"},'
+                '"reference":{"translate":{"pit_raw_canonical":"target.dck"}}}',
+                '{"id":"b2_b","band":"B2","source":{"it_text_v1":"source.it"},'
+                '"reference":{"translate":{"pit_raw_canonical":"target.dck"}}}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "train.jsonl"
+
+    count = prepare_sft_examples(
+        dataset_index=index,
+        output_path=output,
+        limit=3,
+    )
+
+    rows = output.read_text(encoding="utf-8").splitlines()
+    assert count == 3
+    assert sum('"band": "B0"' in row for row in rows) == 1
+    assert sum('"band": "B1"' in row for row in rows) == 1
+    assert sum('"band": "B2"' in row for row in rows) == 1
+
+
 def test_parse_band_repeats_parses_cli_values() -> None:
     assert parse_band_repeats(["B2=2", "b3=3"]) == {"B2": 2, "B3": 3}
+
+
+def test_resolve_band_repeats_merges_preset_and_cli_overrides() -> None:
+    assert resolve_band_repeats(["B4=5"], preset="b45_focus") == {"B3": 2, "B4": 5, "B5": 4}
 
 
 def test_failure_taxonomy_distinguishes_it_source_echo_from_generic_malformed_pit() -> None:

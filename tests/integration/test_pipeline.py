@@ -77,7 +77,7 @@ def test_stage_pipeline_matches_shipped_example1_output(tmp_path: Path) -> None:
     assert read_deck_cards(pipeline.run.output_deck) == read_deck_cards(Path(baseline["output_deck"]))  # type: ignore[arg-type]
 
 
-def test_generate_accepted_bands_b0_through_b3(tmp_path: Path) -> None:
+def test_generate_accepted_bands_b0_through_b5(tmp_path: Path) -> None:
     runner = SimhRunner(repo_root=REPO_ROOT)
     b0 = generate_accepted_programs(
         runner=runner,
@@ -107,14 +107,32 @@ def test_generate_accepted_bands_b0_through_b3(tmp_path: Path) -> None:
         output_dir=tmp_path / "b3",
         start_seed=300,
     )
+    b4 = generate_accepted_programs(
+        runner=runner,
+        band="B4",
+        count=1,
+        output_dir=tmp_path / "b4",
+        start_seed=400,
+    )
+    b5 = generate_accepted_programs(
+        runner=runner,
+        band="B5",
+        count=1,
+        output_dir=tmp_path / "b5",
+        start_seed=500,
+    )
     assert b0["accepted"] == 1
     assert b1["accepted"] == 1
     assert b2["accepted"] == 1
     assert b3["accepted"] == 1
+    assert b4["accepted"] == 1
+    assert b5["accepted"] == 1
     assert Path(b0["index_path"]).exists()
     assert Path(b1["index_path"]).exists()
     assert Path(b2["index_path"]).exists()
     assert Path(b3["index_path"]).exists()
+    assert Path(b4["index_path"]).exists()
+    assert Path(b5["index_path"]).exists()
 
 
 def test_build_small_pilot_corpus(tmp_path: Path) -> None:

@@ -33,7 +33,7 @@ ibm650-it pipeline --source third_party/simh/I650/sw/it/it_example_2_src.txt --o
 ibm650-it generate-accepted --band B1 --count 10 --output artifacts/datasets/b1_pilot
 ibm650-it build-pilot-corpus --output artifacts/datasets/pilot_1000 --total-count 1000 --workers 8
 ibm650-it build-stage-corpus --stage 2k --output artifacts/datasets/stage_2k --workers 8
-ibm650-it prepare-sft --dataset-index artifacts/datasets/pilot_1000/splits/synthetic_train.jsonl --output artifacts/datasets/pilot_1000/sft/train.jsonl --limit 128
+ibm650-it prepare-sft --dataset-index artifacts/datasets/pilot_1000/splits/synthetic_train.jsonl --output artifacts/datasets/pilot_1000/sft/train.jsonl --limit 128 --band-repeat-preset b45_focus
 ibm650-it train-model --sft-jsonl artifacts/datasets/pilot_1000/sft/train.jsonl --output artifacts/models/m4_smoke
 ibm650-it run-inference --reference-index artifacts/datasets/pilot_1000/splits/synthetic_dev.jsonl --mode fine_tuned --model artifacts/models/m4_smoke --output artifacts/eval_reports/m4_fine
 ibm650-it reevaluate-predictions --reference-index artifacts/datasets/pilot_1000/splits/synthetic_dev.jsonl --prediction-index artifacts/eval_reports/m4_fine/predictions.jsonl --output artifacts/eval_reports/m4_fine
@@ -66,12 +66,14 @@ The implemented baseline covers:
 
 - M0 source locking and SIMH build support.
 - M1 stage-separated reference pipeline with preserved artifacts.
-- M2 B0/B1-capable AST, bounds, renderer, and sample generator.
+- M2 B0-B5-capable AST, bounds, renderer, and synthetic sample generator.
 - M3 pilot corpus builder with provenance, dedupe, and alpha-hash splits.
-- M4 smoke SFT preparation, smoke training backend, and zero-shot/few-shot/fine-tuned evaluation runs.
+- M4 SFT preparation with higher-band repeat presets, smoke/QLoRA training backends, and zero-shot/few-shot/fine-tuned evaluation runs.
 - Runpod orchestration for remote bootstrap, training, artifact sync, and pod teardown.
 
 Full language coverage, larger runtime packages, and direct machine-code targets remain out of scope for v1.
+
+`B5` input-dependent samples use a simulator-backed helper program to punch valid IT `READ` cards, so the corpus can exercise `READ` without hand-maintaining a parallel raw card codec.
 
 ## Smoke Training Note
 

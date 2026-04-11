@@ -20,7 +20,7 @@ from ibm650_it.pit.normalize_pit import canonicalize_pit_file
 from ibm650_it.simh.runner import SimhRunner
 from ibm650_it.source.render_it_text import render_program
 from ibm650_it.training.infer import run_inference
-from ibm650_it.training.prepare_sft import parse_band_repeats, prepare_sft_examples
+from ibm650_it.training.prepare_sft import BAND_REPEAT_PRESETS, prepare_sft_examples, resolve_band_repeats
 from ibm650_it.training.thinking_ablation import run_thinking_ablation
 from ibm650_it.training.train_unsloth import TrainConfig, train_model
 
@@ -133,7 +133,7 @@ def cmd_prepare_sft(args: argparse.Namespace) -> None:
         dataset_index=Path(args.dataset_index),
         output_path=Path(args.output),
         limit=args.limit,
-        band_repeats=parse_band_repeats(args.band_repeat),
+        band_repeats=resolve_band_repeats(args.band_repeat, preset=args.band_repeat_preset),
     )
     _print_json({"records_written": records, "output": args.output})
 
@@ -341,7 +341,7 @@ def cmd_train_eval(args: argparse.Namespace) -> None:
     records_written = prepare_sft_examples(
         dataset_index=train_index,
         output_path=sft_path,
-        band_repeats=parse_band_repeats(args.band_repeat),
+        band_repeats=resolve_band_repeats(args.band_repeat, preset=args.band_repeat_preset),
     )
 
     train_summary = train_model(
@@ -413,7 +413,7 @@ def cmd_overfit_sanity(args: argparse.Namespace) -> None:
         dataset_index=dataset_index,
         output_path=sft_path,
         limit=args.example_count,
-        band_repeats=parse_band_repeats(args.band_repeat),
+        band_repeats=resolve_band_repeats(args.band_repeat, preset=args.band_repeat_preset),
     )
     train_summary = train_model(
         sft_path=sft_path,
@@ -537,6 +537,7 @@ def build_parser() -> argparse.ArgumentParser:
     sft.add_argument("--output", required=True)
     sft.add_argument("--limit", type=int)
     sft.add_argument("--band-repeat", action="append", default=[])
+    sft.add_argument("--band-repeat-preset", choices=sorted(BAND_REPEAT_PRESETS))
     sft.set_defaults(func=cmd_prepare_sft)
 
     pilot = subparsers.add_parser("build-pilot-corpus")
@@ -550,7 +551,7 @@ def build_parser() -> argparse.ArgumentParser:
     pilot.set_defaults(func=cmd_build_pilot_corpus)
 
     stage = subparsers.add_parser("build-stage-corpus")
-    stage.add_argument("--stage", choices=["2k", "5k", "10k"], required=True)
+    stage.add_argument("--stage", choices=["2k", "5k", "10k", "20k", "25k"], required=True)
     stage.add_argument("--output", required=True)
     stage.add_argument("--workers", type=int, default=4)
     stage.add_argument("--max-attempts-per-band", type=int)
@@ -591,7 +592,7 @@ def build_parser() -> argparse.ArgumentParser:
     infer.add_argument("--support-sft")
     infer.add_argument("--few-shot-k", type=int, default=4)
     infer.add_argument("--limit", type=int)
-    infer.add_argument("--max-new-tokens", type=int, default=1536)
+    infer.add_argument("--max-new-tokens", type=int, default=2048)
     infer.add_argument(
         "--inference-batch-size",
         type=int,
@@ -614,7 +615,7 @@ def build_parser() -> argparse.ArgumentParser:
     thinking.add_argument("--model", required=True)
     thinking.add_argument("--output", required=True)
     thinking.add_argument("--limit", type=int)
-    thinking.add_argument("--max-new-tokens", type=int, default=1536)
+    thinking.add_argument("--max-new-tokens", type=int, default=2048)
     thinking.add_argument("--eval-mode", choices=["inline", "skip"], default="inline")
     thinking.add_argument("--failure-archive-limit", type=int, default=25)
     thinking.add_argument("--step-budget", default="50M")
@@ -702,9 +703,10 @@ def build_parser() -> argparse.ArgumentParser:
     train_eval.add_argument("--eval-split", default="synthetic_dev.jsonl")
     train_eval.add_argument("--few-shot-k", type=int, default=4)
     train_eval.add_argument("--band-repeat", action="append", default=[])
+    train_eval.add_argument("--band-repeat-preset", choices=sorted(BAND_REPEAT_PRESETS))
     train_eval.add_argument("--limit", type=int)
     train_eval.add_argument("--max-examples", type=int)
-    train_eval.add_argument("--max-new-tokens", type=int, default=1536)
+    train_eval.add_argument("--max-new-tokens", type=int, default=2048)
     train_eval.add_argument("--inference-batch-size", type=int, default=1)
     train_eval.add_argument("--eval-mode", choices=["inline", "skip"], default="inline")
     train_eval.add_argument("--failure-archive-limit", type=int, default=25)
@@ -719,9 +721,10 @@ def build_parser() -> argparse.ArgumentParser:
     smoke_train.add_argument("--eval-split", default="synthetic_dev.jsonl")
     smoke_train.add_argument("--few-shot-k", type=int, default=4)
     smoke_train.add_argument("--band-repeat", action="append", default=[])
+    smoke_train.add_argument("--band-repeat-preset", choices=sorted(BAND_REPEAT_PRESETS))
     smoke_train.add_argument("--limit", type=int)
     smoke_train.add_argument("--max-examples", type=int)
-    smoke_train.add_argument("--max-new-tokens", type=int, default=1536)
+    smoke_train.add_argument("--max-new-tokens", type=int, default=2048)
     smoke_train.add_argument("--inference-batch-size", type=int, default=1)
     smoke_train.add_argument("--eval-mode", choices=["inline", "skip"], default="inline")
     smoke_train.add_argument("--failure-archive-limit", type=int, default=25)
@@ -752,7 +755,8 @@ def build_parser() -> argparse.ArgumentParser:
     overfit.add_argument("--per-device-train-batch-size", type=int, default=1)
     overfit.add_argument("--gradient-accumulation-steps", type=int, default=8)
     overfit.add_argument("--band-repeat", action="append", default=[])
-    overfit.add_argument("--max-new-tokens", type=int, default=1536)
+    overfit.add_argument("--band-repeat-preset", choices=sorted(BAND_REPEAT_PRESETS))
+    overfit.add_argument("--max-new-tokens", type=int, default=2048)
     overfit.add_argument("--inference-batch-size", type=int, default=1)
     overfit.add_argument("--eval-mode", choices=["inline", "skip"], default="inline")
     overfit.add_argument("--failure-archive-limit", type=int, default=25)

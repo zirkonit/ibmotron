@@ -6,7 +6,15 @@ from typing import Any
 
 from ibm650_it.dataset.build_records import alpha_normalize_source
 from ibm650_it.dataset.io import resolve_record_base, resolve_record_path
+from ibm650_it.dataset.sampling import stable_limit_records
 from ibm650_it.training.prompt_templates import build_prompt, wrap_pit_completion
+
+
+BAND_REPEAT_PRESETS = {
+    # Higher bands are newer and structurally longer; give them extra epochs of
+    # exposure during SFT without dropping the solved lower-band support.
+    "b45_focus": {"B3": 2, "B4": 3, "B5": 4},
+}
 
 
 def parse_band_repeats(values: list[str] | None) -> dict[str, int]:
@@ -23,6 +31,18 @@ def parse_band_repeats(values: list[str] | None) -> dict[str, int]:
     return repeats
 
 
+def resolve_band_repeats(
+    values: list[str] | None,
+    *,
+    preset: str | None = None,
+) -> dict[str, int]:
+    if preset is not None and preset not in BAND_REPEAT_PRESETS:
+        raise KeyError(f"unknown band repeat preset: {preset}")
+    repeats = dict(BAND_REPEAT_PRESETS.get(preset or "", {}))
+    repeats.update(parse_band_repeats(values))
+    return repeats
+
+
 def prepare_sft_examples(
     *,
     dataset_index: Path,
@@ -32,7 +52,11 @@ def prepare_sft_examples(
 ) -> int:
     records = [json.loads(line) for line in dataset_index.read_text(encoding="utf-8").splitlines() if line.strip()]
     if limit is not None:
-        records = records[:limit]
+        records = stable_limit_records(
+            records,
+            limit,
+            salt=f"prepare_sft_examples:{dataset_index}",
+        )
     base_dir = resolve_record_base(dataset_index)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     count = 0

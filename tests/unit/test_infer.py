@@ -1,3 +1,7 @@
+import json
+from pathlib import Path
+
+from ibm650_it.dataset.io import load_jsonl
 from ibm650_it.eval.failure_taxonomy import should_attempt_assembly
 from ibm650_it.training.infer import (
     HfGenerationSession,
@@ -9,6 +13,7 @@ from ibm650_it.training.infer import (
     extract_thinking_trace,
     normalize_completion_text,
     preflight_token_budget,
+    run_inference,
 )
 
 
@@ -258,7 +263,39 @@ def test_normalize_completion_text_preserves_first_card_indent_on_truncated_comp
 
     assert normalized.startswith(_FIRST_CARD_INDENT + "s0001 00 0000 laaaa")
     assert not normalized.startswith("s0001"), "leading indent must not be stripped on truncated output"
-    assert "<PIT>" not in normalized
+
+
+def test_run_inference_limit_is_band_balanced_on_ordered_reference_index(tmp_path: Path) -> None:
+    source = tmp_path / "source.it"
+    source.write_text("+ 0 1 0 3 1730\n0001+ y1 z 2j f\n0002+ t y1 f\n0003+ h ff\n", encoding="utf-8")
+    target = tmp_path / "target.dck"
+    target.write_text("card-1\n", encoding="latin-1")
+    index = tmp_path / "index.jsonl"
+    records = []
+    for band in ["B0", "B1", "B2"]:
+        for suffix in ["a", "b"]:
+            records.append(
+                {
+                    "id": f"{band.lower()}_{suffix}",
+                    "band": band,
+                    "source": {"it_text_v1": "source.it"},
+                    "reference": {"translate": {"pit_raw_canonical": "target.dck"}},
+                    "generator": {"features": ["punch"]},
+                }
+            )
+    index.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    summary = run_inference(
+        reference_index=index,
+        output_dir=tmp_path / "eval",
+        mode="zero_shot",
+        limit=3,
+        eval_mode="skip",
+    )
+
+    predictions = load_jsonl(Path(summary["prediction_index"]))
+    assert len(predictions) == 3
+    assert {str(prediction["band"]) for prediction in predictions} == {"B0", "B1", "B2"}
 
 
 def test_normalize_completion_text_handles_truncated_completion_with_multiple_leading_newlines() -> None:

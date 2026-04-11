@@ -19,11 +19,11 @@ def test_slice_dataset_copies_only_selected_sample_roots(tmp_path: Path) -> None
         (path / "source.it").write_text("placeholder", encoding="utf-8")
 
     train_records = [
-        {"id": "a", "source": {"it_text_v1": "accepted/B0/0001_000001/source.it"}},
-        {"id": "b", "source": {"it_text_v1": "accepted/B1/0001_000101/source.it"}},
+        {"id": "a", "band": "B0", "source": {"it_text_v1": "accepted/B0/0001_000001/source.it"}},
+        {"id": "b", "band": "B1", "source": {"it_text_v1": "accepted/B1/0001_000101/source.it"}},
     ]
     dev_records = [
-        {"id": "b", "source": {"it_text_v1": str(source_root / "accepted" / "B1" / "0001_000101" / "source.it")}},
+        {"id": "b", "band": "B1", "source": {"it_text_v1": str(source_root / "accepted" / "B1" / "0001_000101" / "source.it")}},
     ]
     golden_records = [
         {"id": "g", "source": {"it_text_v1": "historical_golden/it_example_1/source.it"}},

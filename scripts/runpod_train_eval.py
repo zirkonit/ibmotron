@@ -45,10 +45,10 @@ COLLECT_WATCHER_LOG_FILENAME = ".runpod_collect_watcher.log"
 REAL_BASELINE_QLORA_BITS = 0
 REAL_BASELINE_LEARNING_RATE = 2e-4
 REAL_BASELINE_EPOCHS = 5
-# stage_2k reference PIT decks are 480–1154 tokens (A40 Nemotron-3-Nano-4B tokenizer);
-# B2/B3 all exceed 1024, so every prior run clipped the dictionary tail and forced
-# the normalizer onto the truncated-completion fallback path. 1536 leaves ~33% headroom.
-REAL_BASELINE_MAX_NEW_TOKENS = 1536
+# The B4/B5 expansion materially lengthens PIT deck tails beyond the B2/B3-only
+# stage_2k profile. 2048 keeps greedy eval out of the truncation path while still
+# fitting comfortably on the A40/A6000 class pods used by the repo.
+REAL_BASELINE_MAX_NEW_TOKENS = 2048
 
 
 REMOTE_BASE_INCLUDE_PATHS = [
@@ -244,6 +244,9 @@ def _base_runtime_steps() -> list[str]:
 
 def _band_repeat_flags(args: argparse.Namespace) -> str:
     flags: list[str] = []
+    preset = getattr(args, "band_repeat_preset", None)
+    if preset:
+        flags.append(f"--band-repeat-preset {preset}")
     for value in getattr(args, "band_repeat", []) or []:
         flags.append(f"--band-repeat {value}")
     return " ".join(flags)
@@ -420,6 +423,7 @@ def _job_metadata_payload(args: argparse.Namespace, *, pod_id: str, detached: bo
         "remote_output": args.remote_output,
         "local_output": args.local_output,
         "band_repeat": list(getattr(args, "band_repeat", []) or []),
+        "band_repeat_preset": getattr(args, "band_repeat_preset", None),
         "max_examples": args.max_examples,
         "limit": args.limit,
         "detached": detached,
@@ -595,6 +599,17 @@ def _finalize_local_output(args: argparse.Namespace, local_output_root: Path) ->
             step_budget=args.step_budget,
             timeout_seconds=args.timeout_seconds,
         )
+    if args.run_mode == "inference-only":
+        return finalize_train_eval_output(
+            dataset_root=REPO_ROOT / f"artifacts/datasets/{args.dataset_name}",
+            output_root=local_output_root,
+            eval_split=args.eval_split,
+            modes=[args.inference_mode],
+            failure_archive_limit=args.failure_archive_limit,
+            repo_root=REPO_ROOT,
+            step_budget=args.step_budget,
+            timeout_seconds=args.timeout_seconds,
+        )
     return finalize_train_eval_output(
         dataset_root=REPO_ROOT / f"artifacts/datasets/{args.dataset_name}",
         output_root=local_output_root,
@@ -621,6 +636,7 @@ def _hydrate_args_from_metadata(args: argparse.Namespace, *, force: bool = False
         "inference_mode",
         "remote_output",
         "band_repeat",
+        "band_repeat_preset",
     ]:
         if force or getattr(args, field, None) in (None, False):
             value = metadata.get(field)
@@ -725,6 +741,7 @@ def main() -> None:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--few-shot-k", type=int, default=4)
     parser.add_argument("--band-repeat", action="append", default=[])
+    parser.add_argument("--band-repeat-preset")
     parser.add_argument("--train-split", default="synthetic_train.jsonl")
     parser.add_argument("--eval-split", default="synthetic_dev.jsonl")
     parser.add_argument("--limit", type=int)

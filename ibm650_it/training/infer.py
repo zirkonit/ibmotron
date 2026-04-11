@@ -11,6 +11,7 @@ from typing import Any, Iterable
 
 from ibm650_it import REPO_ROOT
 from ibm650_it.dataset.io import load_jsonl, relativize_record_paths, resolve_record_base, resolve_record_path, write_jsonl
+from ibm650_it.dataset.sampling import stable_limit_records
 from ibm650_it.eval.exact_match import compare_pit_files
 from ibm650_it.eval.failure_taxonomy import classify_failure
 from ibm650_it.eval.reevaluate import reevaluate_prediction_records
@@ -656,7 +657,11 @@ def run_inference(
     output_dir.mkdir(parents=True, exist_ok=True)
     reference_records = load_jsonl(reference_index)
     if limit is not None:
-        reference_records = reference_records[:limit]
+        reference_records = stable_limit_records(
+            reference_records,
+            limit,
+            salt=f"run_inference:{reference_index}",
+        )
     reference_base = resolve_record_base(reference_index)
     prediction_index = output_dir / "predictions.jsonl"
     prediction_records = [

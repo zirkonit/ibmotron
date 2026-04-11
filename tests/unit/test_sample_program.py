@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 from ibm650_it.dataset.build_records import alpha_normalize_source
-from ibm650_it.generate.sample_program import generate_band_program, infer_features
+from ibm650_it.generate.sample_program import generate_band_program, generate_band_sample, infer_features
 from ibm650_it.source.render_it_text import render_program
-from ibm650_it.source.ast import Goto, IfGoto, Iterate
+from ibm650_it.source.ast import Goto, IfGoto, Iterate, Punch, Read
+
+
+def test_generate_b0_has_large_alpha_unique_space() -> None:
+    alpha_sources = {
+        alpha_normalize_source(render_program(generate_band_program("B0", seed=seed)))
+        for seed in range(1, 1201)
+    }
+
+    assert len(alpha_sources) >= 1000
 
 
 def test_generate_b2_contains_control_flow_and_positive_header() -> None:
@@ -81,3 +90,67 @@ def test_generate_b3_families_span_wider_loop_bounds() -> None:
         f"max observed was {max_stop_seen}. Either the new B3 families are not in the rotation "
         f"or _loop_bounds_wide() is too narrow."
     )
+
+
+def test_generate_b4_contains_mixed_control_flow_iteration_and_multiple_outputs() -> None:
+    program = generate_band_program("B4", seed=21)
+
+    assert any(isinstance(statement, Iterate) for statement in program.statements)
+    assert any(isinstance(statement, Goto) for statement in program.statements)
+    assert any(isinstance(statement, IfGoto) for statement in program.statements)
+    assert sum(isinstance(statement, Punch) for statement in program.statements) >= 2
+    assert program.header is not None
+    assert program.header.N > 0
+    features = infer_features(program)
+    assert "iterate" in features
+    assert "goto" in features
+    assert "if_goto" in features
+    assert "multi_output" in features
+
+
+def test_generate_b4_has_large_alpha_unique_space() -> None:
+    alpha_sources = {
+        alpha_normalize_source(render_program(generate_band_program("B4", seed=seed)))
+        for seed in range(1, 201)
+    }
+
+    assert len(alpha_sources) >= 180
+
+
+def test_generate_b4_every_seed_contains_mixed_invariants() -> None:
+    for seed in range(1, 201):
+        program = generate_band_program("B4", seed=seed)
+        features = infer_features(program)
+        assert any(isinstance(statement, Iterate) for statement in program.statements), f"seed {seed} missing Iterate"
+        assert any(isinstance(statement, Goto) for statement in program.statements), f"seed {seed} missing Goto"
+        assert any(isinstance(statement, IfGoto) for statement in program.statements), f"seed {seed} missing IfGoto"
+        assert sum(isinstance(statement, Punch) for statement in program.statements) >= 2, (
+            f"seed {seed} expected at least two Punch statements"
+        )
+        assert "multi_output" in features, f"seed {seed} missing multi_output feature"
+
+
+def test_generate_b5_contains_read_and_input_program() -> None:
+    generated = generate_band_sample("B5", seed=31)
+    program = generated.program
+
+    assert any(isinstance(statement, Read) for statement in program.statements)
+    assert generated.input_program is not None
+    assert any(isinstance(statement, Punch) for statement in generated.input_program.statements)
+    assert not any(isinstance(statement, Read) for statement in generated.input_program.statements)
+    assert program.header is not None
+    assert program.header.N > 0
+    features = infer_features(program)
+    assert "read" in features
+    assert "iterate" in features
+    assert "if_goto" in features
+    assert "multi_output" in features
+
+
+def test_generate_b5_has_large_alpha_unique_space() -> None:
+    alpha_sources = {
+        alpha_normalize_source(render_program(generate_band_program("B5", seed=seed)))
+        for seed in range(1, 201)
+    }
+
+    assert len(alpha_sources) >= 180
