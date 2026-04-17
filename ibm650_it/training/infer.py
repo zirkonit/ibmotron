@@ -191,6 +191,10 @@ class HfGenerationSession:
     model: Any
     device: Any
     stop_token_sequences: list[list[int]]
+    pad_token_id: int | None
+    eos_token_id: int | list[int] | None
+    model_type: str | None
+    supports_batched_generation: bool
 
 
 class StopOnTokenSequence:
@@ -205,24 +209,24 @@ class StopOnTokenSequence:
     """
 
     def __init__(self, stop_token_sequences: list[list[int]]) -> None:
-        self.stop_token_sequences = [sequence for sequence in stop_token_sequences if sequence]
-
-    @staticmethod
-    def _row_length(row: Any) -> int:
-        shape = getattr(row, "shape", None)
-        if shape is not None and len(shape) >= 1:
-            return int(shape[0])
-        return len(row)
+        self.stop_token_sequences = [tuple(seq) for seq in stop_token_sequences if seq]
+        self._max_len = max((len(seq) for seq in self.stop_token_sequences), default=0)
 
     def _row_matches(self, row: Any) -> bool:
-        row_length = self._row_length(row)
+        if not self._max_len:
+            return False
+        shape = getattr(row, "shape", None)
+        row_length = int(shape[0]) if shape is not None and len(shape) >= 1 else len(row)
+        if row_length < self._max_len:
+            # Not enough tokens to match the longest stop sequence; fall back to
+            # per-sequence length checks with a single .tolist() call.
+            tail_slice = row[-row_length:]
+        else:
+            tail_slice = row[-self._max_len :]
+        # Single GPU→CPU transfer per row instead of one per stop sequence.
+        tail = tuple(tail_slice.tolist()) if hasattr(tail_slice, "tolist") else tuple(tail_slice)
         for sequence in self.stop_token_sequences:
-            sequence_length = len(sequence)
-            if row_length < sequence_length:
-                continue
-            tail_slice = row[-sequence_length:]
-            tail = tail_slice.tolist() if hasattr(tail_slice, "tolist") else list(tail_slice)
-            if tail == sequence:
+            if len(sequence) <= len(tail) and tail[len(tail) - len(sequence) :] == sequence:
                 return True
         return False
 
@@ -258,6 +262,137 @@ def _build_stop_token_sequences(tokenizer: Any) -> list[list[int]]:
         sequences.append(encoded)
         seen.add(key)
     return sequences
+
+
+def _resolve_generation_token_ids(
+    *,
+    tokenizer: Any,
+    model_config: Any,
+) -> tuple[int | None, int | list[int] | None]:
+    configured_pad_token_id = getattr(model_config, "pad_token_id", None)
+    configured_eos_token_id = getattr(model_config, "eos_token_id", None)
+
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        if isinstance(configured_pad_token_id, int):
+            tokenizer.pad_token_id = configured_pad_token_id
+        elif getattr(tokenizer, "eos_token", None) is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = configured_pad_token_id
+
+    eos_token_id = configured_eos_token_id
+    if eos_token_id is None:
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+
+    if pad_token_id is None:
+        pad_token_id = eos_token_id
+
+    return pad_token_id, eos_token_id
+
+
+def _supports_safe_batched_hf_generation(model_config: Any) -> bool:
+    model_type = str(getattr(model_config, "model_type", "") or "").lower()
+    return model_type not in {"nemotron_h"}
+
+
+class _TensorStateList(list[Any]):
+    """List wrapper that exposes the tensor-ish interface Nemotron expects."""
+
+    @property
+    def device(self) -> Any | None:
+        for item in self:
+            device = getattr(item, "device", None)
+            if device is not None:
+                return device
+        return None
+
+    def zero_(self) -> "_TensorStateList":
+        for item in self:
+            zero = getattr(item, "zero_", None)
+            if callable(zero):
+                zero()
+        return self
+
+
+def _patch_nemotron_cache_instance(cache: Any, model_config: Any) -> Any:
+    """Backfill attributes/method assumptions missing from Nemotron's cache."""
+    if getattr(cache, "_ibm650_cache_instance_patched", False):
+        return cache
+    if not hasattr(cache, "__dict__"):
+        return cache
+
+    if not hasattr(cache, "conv_kernel_size"):
+        conv_kernel_size = getattr(model_config, "conv_kernel", None)
+        if conv_kernel_size is not None:
+            cache.conv_kernel_size = conv_kernel_size
+
+    conv_states = getattr(cache, "conv_states", None)
+    if isinstance(conv_states, list) and not hasattr(conv_states, "device"):
+        cache.conv_states = _TensorStateList(conv_states)
+
+    ssm_states = getattr(cache, "ssm_states", None)
+    if isinstance(ssm_states, list) and not hasattr(ssm_states, "device"):
+        cache.ssm_states = _TensorStateList(ssm_states)
+
+    cache._ibm650_cache_instance_patched = True
+    return cache
+
+
+def _patch_nemotron_cache_plumbing(model: Any) -> bool:
+    """Fix the ``past_key_values`` / ``cache_params`` name mismatch in Nemotron-H.
+
+    The Nemotron-H remote code's ``prepare_inputs_for_generation`` creates a
+    ``HybridMambaAttentionDynamicCache`` and returns it under the key
+    ``past_key_values``, but its ``forward()`` signature expects the cache as
+    ``cache_params``.  Meanwhile, HuggingFace's ``generate()`` loop picks the
+    cache-kwarg name based on whether ``"mamba"`` appears in the model class
+    name — ``NemotronHForCausalLM`` doesn't contain ``"mamba"``, so the loop
+    routes the cache through ``past_key_values`` and ``forward()`` never sees it.
+
+    The fix: wrap ``prepare_inputs_for_generation`` to bridge both directions:
+
+    *Input side* — on step 2+ the generate loop passes the cache back as
+    ``cache_params`` (because that's the name in the model output dataclass),
+    but the original method only reads ``past_key_values``.  Route it.
+
+    *Output side* — the original returns the cache as ``past_key_values``, but
+    ``forward()`` reads ``cache_params``.  Copy it.
+
+    This is purely a name-routing wrapper — it never touches the cache object
+    itself (no SSM/conv state patching), which is why it's safe unlike the
+    earlier ``_patch_generation_cache_bridge`` that replaced cache methods and
+    corrupted generation.
+    """
+    model_type = str(getattr(getattr(model, "config", None), "model_type", "") or "").lower()
+    if model_type != "nemotron_h":
+        return False
+    original = getattr(model, "prepare_inputs_for_generation", None)
+    if not callable(original) or getattr(original, "_ibm650_cache_plumbing_patched", False):
+        return False
+
+    def patched_prepare_inputs(*args: Any, **kwargs: Any) -> Any:
+        # Input side: after step 1 the generate loop stores the cache as
+        # model_kwargs["cache_params"] (because that's the name in the model
+        # output dataclass).  The original prepare_inputs_for_generation only
+        # reads "past_key_values", so route the cache into that parameter.
+        if kwargs.get("past_key_values") is None and "cache_params" in kwargs:
+            kwargs["past_key_values"] = kwargs["cache_params"]
+        model_inputs = original(*args, **kwargs)
+        # Output side: forward() reads "cache_params", not "past_key_values",
+        # so copy the cache object the original just placed at "past_key_values"
+        # into the "cache_params" slot as well.
+        if isinstance(model_inputs, dict):
+            cache = model_inputs.get("past_key_values")
+            if cache is not None:
+                _patch_nemotron_cache_instance(cache, getattr(model, "config", None))
+                model_inputs["cache_params"] = cache
+        return model_inputs
+
+    patched_prepare_inputs._ibm650_cache_plumbing_patched = True  # type: ignore[attr-defined]
+    model.prepare_inputs_for_generation = patched_prepare_inputs
+    return True
 
 
 def _load_hf_generation_session(
@@ -296,10 +431,15 @@ def _load_hf_generation_session(
     if runtime["device_map"] is None:
         model = model.to(runtime["device"])
     model.eval()
+    if hasattr(model, "merge_and_unload"):
+        model = model.merge_and_unload()
+    _patch_nemotron_cache_plumbing(model)
     if hasattr(model.config, "use_cache"):
         model.config.use_cache = True
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    pad_token_id, eos_token_id = _resolve_generation_token_ids(
+        tokenizer=tokenizer,
+        model_config=model.config,
+    )
     # Left-padding is required for batched generation on decoder-only models:
     # with right-padding, attention over the pad tokens corrupts the KV cache for
     # the "real" tokens and the generated sequence is nonsense. See transformers
@@ -313,6 +453,10 @@ def _load_hf_generation_session(
         model=model,
         device=runtime["device"],
         stop_token_sequences=stop_token_sequences,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        model_type=str(getattr(model.config, "model_type", "") or "") or None,
+        supports_batched_generation=_supports_safe_batched_hf_generation(model.config),
     )
 
 
@@ -368,8 +512,8 @@ def _generate_with_hf_model(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
-            pad_token_id=session.tokenizer.pad_token_id,
-            eos_token_id=session.tokenizer.eos_token_id,
+            pad_token_id=session.pad_token_id,
+            eos_token_id=session.eos_token_id,
             stopping_criteria=stopping_criteria,
             use_cache=True,
         )
@@ -379,8 +523,8 @@ def _generate_with_hf_model(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
-                pad_token_id=session.tokenizer.pad_token_id,
-                eos_token_id=session.tokenizer.eos_token_id,
+                pad_token_id=session.pad_token_id,
+                eos_token_id=session.eos_token_id,
                 stopping_criteria=stopping_criteria,
                 use_cache=True,
             )
@@ -460,8 +604,8 @@ def _generate_with_hf_model_batch(
             attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             do_sample=False,
-            pad_token_id=session.tokenizer.pad_token_id,
-            eos_token_id=session.tokenizer.eos_token_id,
+            pad_token_id=session.pad_token_id,
+            eos_token_id=session.eos_token_id,
             stopping_criteria=stopping_criteria,
             use_cache=True,
         )
@@ -759,9 +903,23 @@ def run_inference(
         completed_ids.add(str(reference["id"]))
         write_jsonl(prediction_index, prediction_records)
 
+    requested_inference_batch_size = max(1, int(inference_batch_size))
+    if (
+        hf_session is not None
+        and requested_inference_batch_size > 1
+        and not hf_session.supports_batched_generation
+    ):
+        print(
+            "[inference][WARN] model-backed batched generation is disabled for "
+            f"{hf_session.model_type or 'this model'}; falling back to batch_size=1 "
+            "to avoid invalid punctuation-only completions.",
+            file=sys.stderr,
+            flush=True,
+        )
     use_batched_hf = (
         hf_session is not None
-        and inference_batch_size > 1
+        and requested_inference_batch_size > 1
+        and hf_session.supports_batched_generation
     )
 
     try:
@@ -774,8 +932,8 @@ def run_inference(
                 for reference in reference_records
                 if str(reference["id"]) not in completed_ids
             ]
-            for chunk_start in range(0, len(pending), inference_batch_size):
-                chunk = pending[chunk_start : chunk_start + inference_batch_size]
+            for chunk_start in range(0, len(pending), requested_inference_batch_size):
+                chunk = pending[chunk_start : chunk_start + requested_inference_batch_size]
                 chunk_started = time.perf_counter()
                 chunk_prompts: list[str] = []
                 chunk_prompt_input_ids: list[Any] = []

@@ -17,7 +17,7 @@ from ibm650_it.dataset.provenance import build_provenance
 from ibm650_it.dataset.split import build_exact_splits, split_by_alpha_hash
 from ibm650_it.dataset.stages import stage_band_counts, stage_split_counts
 from ibm650_it.generate.sample_program import generate_band_sample, infer_features, materialize_input_deck
-from ibm650_it.simh.runner import SimhRunner
+from ibm650_it.simh.runner import SimhRunner, validate_run_result
 from ibm650_it.source.render_it_card80 import render_simh_source_deck
 from ibm650_it.source.render_it_text import render_program
 
@@ -57,6 +57,7 @@ def _build_candidate(
         output_dir=sample_dir / "pipeline",
         input_deck=input_deck,
     )
+    validate_run_result(pipeline.run, context="reference pipeline")
     record = build_record(
         band=band,
         seed=seed,
@@ -178,6 +179,7 @@ def add_historical_golden_records(
             input_deck=spec["input"],
             output_dir=sample_dir / "pipeline",
         )
+        validate_run_result(pipeline.run, context=f"historical golden {spec['name']}")
         record = build_record(
             band="historical_golden",
             seed=0,

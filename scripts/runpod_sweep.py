@@ -12,6 +12,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ibm650_it.cloud import RunpodCtl
+from ibm650_it.training.hf_qlora import DEFAULT_TRANSFORMERS_QLORA_MODEL
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -199,7 +200,7 @@ def main() -> None:
     parser.add_argument("--run-mode", choices=["train-eval"], default="train-eval")
     parser.add_argument("--dataset-name", default="pilot_remote_128_20")
     parser.add_argument("--backend", default="transformers_qlora")
-    parser.add_argument("--model-name", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
+    parser.add_argument("--model-name", default=DEFAULT_TRANSFORMERS_QLORA_MODEL)
     parser.add_argument("--gpu-id", default="NVIDIA A40")
     parser.add_argument("--cloud-type", default="SECURE")
     parser.add_argument("--image", default="runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404")

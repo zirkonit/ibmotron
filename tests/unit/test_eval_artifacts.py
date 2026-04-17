@@ -5,7 +5,7 @@ from pathlib import Path
 
 from ibm650_it.dataset.io import load_jsonl
 from ibm650_it.eval.archive import archive_failures
-from ibm650_it.eval.reevaluate import reevaluate_prediction_records
+from ibm650_it.eval.reevaluate import _reference_has_successful_run, reevaluate_prediction_records
 from ibm650_it.eval.report import build_evaluation_report
 
 
@@ -176,3 +176,23 @@ def test_reevaluate_predictions_persists_full_exception_metadata_for_missing_can
     assert "missing_candidate.dck" in reevaluated["assemble"]["error_message"]
     assert reevaluated["timings"]["generation_seconds"] == 0.5
     assert reevaluated["timings"]["evaluation_seconds"] >= 0.0
+
+
+def test_reference_has_successful_run_requires_nonempty_output_deck(tmp_path: Path) -> None:
+    empty_output = tmp_path / "empty_output.dck"
+    empty_output.write_text("", encoding="latin-1")
+    nonempty_output = tmp_path / "nonempty_output.dck"
+    nonempty_output.write_text("card\n", encoding="latin-1")
+
+    assert not _reference_has_successful_run(
+        {"reference": {"run": {"status": "ok", "output_deck": "empty_output.dck"}}},
+        tmp_path,
+    )
+    assert not _reference_has_successful_run(
+        {"reference": {"run": {"status": "run_error", "output_deck": "nonempty_output.dck"}}},
+        tmp_path,
+    )
+    assert _reference_has_successful_run(
+        {"reference": {"run": {"status": "ok", "output_deck": "nonempty_output.dck"}}},
+        tmp_path,
+    )

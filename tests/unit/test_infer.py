@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from ibm650_it.dataset.io import load_jsonl
 from ibm650_it.eval.failure_taxonomy import should_attempt_assembly
 from ibm650_it.training.infer import (
@@ -10,6 +12,10 @@ from ibm650_it.training.infer import (
     _generate_with_hf_model,
     _hf_inference_runtime,
     _log_preflight_report,
+    _patch_nemotron_cache_instance,
+    _patch_nemotron_cache_plumbing,
+    _resolve_generation_token_ids,
+    _supports_safe_batched_hf_generation,
     extract_thinking_trace,
     normalize_completion_text,
     preflight_token_budget,
@@ -75,7 +81,30 @@ class DummyModel:
         assert kwargs["input_ids"] == [[10, 11]]
         assert kwargs["max_new_tokens"] == 7
         assert kwargs["use_cache"] is True
+        assert kwargs["pad_token_id"] == 1
+        assert kwargs["eos_token_id"] == 2
         return [[10, 11, 21, 22, 23]]
+
+
+class DummyTokenizerWithoutPad:
+    def __init__(self) -> None:
+        self.pad_token = None
+        self.pad_token_id = None
+        self.eos_token = "<|im_end|>"
+        self.eos_token_id = 11
+
+
+class DummyNemotronModelConfig:
+    model_type = "nemotron_h"
+    pad_token_id = 0
+    eos_token_id = 2
+    conv_kernel = 4
+
+
+class DummyLlamaModelConfig:
+    model_type = "llama"
+    pad_token_id = 0
+    eos_token_id = 2
 
 
 def test_hf_inference_runtime_uses_single_cuda_device_without_auto_sharding() -> None:
@@ -104,6 +133,10 @@ def test_generate_with_hf_model_uses_session_model_and_strips_prompt_tokens() ->
         model=DummyModel(),
         device="cuda:0",
         stop_token_sequences=[[3, 4], [5, 6]],
+        pad_token_id=1,
+        eos_token_id=2,
+        model_type="dummy",
+        supports_batched_generation=True,
     )
 
     completion = _generate_with_hf_model(
@@ -121,6 +154,10 @@ def test_generate_with_hf_model_accepts_pre_tokenized_input_ids() -> None:
         model=DummyModel(),
         device="cuda:0",
         stop_token_sequences=[],
+        pad_token_id=1,
+        eos_token_id=2,
+        model_type="dummy",
+        supports_batched_generation=True,
     )
 
     completion = _generate_with_hf_model(
@@ -131,6 +168,182 @@ def test_generate_with_hf_model_accepts_pre_tokenized_input_ids() -> None:
     )
 
     assert completion == "21,22,23"
+
+
+def test_resolve_generation_token_ids_prefers_model_config_pad_and_eos_ids() -> None:
+    tokenizer = DummyTokenizerWithoutPad()
+
+    pad_token_id, eos_token_id = _resolve_generation_token_ids(
+        tokenizer=tokenizer,
+        model_config=DummyNemotronModelConfig(),
+    )
+
+    assert tokenizer.pad_token_id == 0
+    assert pad_token_id == 0
+    assert eos_token_id == 2
+
+
+def test_supports_safe_batched_hf_generation_disables_nemotron_h() -> None:
+    assert _supports_safe_batched_hf_generation(DummyNemotronModelConfig()) is False
+    assert _supports_safe_batched_hf_generation(DummyLlamaModelConfig()) is True
+
+
+def test_patch_nemotron_cache_plumbing_bridges_both_directions() -> None:
+    """Replay the exact HuggingFace generate() loop keyword flow.
+
+    The loop does three things per step that matter for cache routing:
+
+    1. ``model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)``
+       — unpacks **model_kwargs** into keyword args.
+    2. ``outputs = self(**model_inputs, ...)``
+       — unpacks the returned dict into ``forward()`` kwargs.
+    3. ``_update_model_kwargs_for_generation(outputs, model_kwargs)``
+       — scans ``ALL_CACHE_NAMES`` in the output and stores the first hit in
+       ``model_kwargs`` under its original name.
+
+    For NemotronH the output dataclass field is ``cache_params``, so after
+    step 3 ``model_kwargs["cache_params"] = cache``.  But ``past_key_values``
+    was set to ``None`` by ``_prepare_cache_for_generation`` in the prefill and
+    is **never** cleared — so on step 2+ model_kwargs has **both** keys:
+    ``past_key_values=None`` and ``cache_params=cache``.
+
+    Without our patch the model's ``prepare_inputs_for_generation`` only reads
+    ``past_key_values``, sees None, and creates a fresh cache every step.
+    """
+
+    created_caches: list[str] = []
+
+    class FakeNemotronModel:
+        class config:
+            model_type = "nemotron_h"
+
+        def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
+            if past_key_values is None:
+                cache = f"cache_{len(created_caches)}"
+                created_caches.append(cache)
+            else:
+                cache = past_key_values
+            return {"input_ids": input_ids, "past_key_values": cache}
+
+    model = FakeNemotronModel()
+    assert _patch_nemotron_cache_plumbing(model) is True
+
+    # --- Step 1: prefill ---
+    # _prepare_cache_for_generation sets model_kwargs["past_key_values"] = None
+    # (because "mamba" not in "NemotronHForCausalLM").
+    model_kwargs: dict[str, object] = {"past_key_values": None}
+
+    model_inputs = model.prepare_inputs_for_generation([1, 2, 3], **model_kwargs)
+    assert model_inputs["past_key_values"] == "cache_0"
+    assert model_inputs["cache_params"] == "cache_0"  # → forward() sees it
+
+    # Simulate forward() output + _update_model_kwargs_for_generation:
+    # the output dataclass has field "cache_params", so model_kwargs gets that key.
+    model_kwargs["cache_params"] = model_inputs["cache_params"]
+    # past_key_values stays None — transformers never updates it for mamba-style models.
+
+    # --- Step 2: first decode ---
+    # model_kwargs now has past_key_values=None AND cache_params="cache_0".
+    assert model_kwargs["past_key_values"] is None
+    assert model_kwargs["cache_params"] == "cache_0"
+
+    model_inputs = model.prepare_inputs_for_generation([4], **model_kwargs)
+    assert model_inputs["past_key_values"] == "cache_0"  # input side: routed
+    assert model_inputs["cache_params"] == "cache_0"     # output side: copied
+    assert len(created_caches) == 1, "must reuse cache, not create a second one"
+
+    # Simulate _update_model_kwargs again.
+    model_kwargs["cache_params"] = model_inputs["cache_params"]
+
+    # --- Step 3: second decode (same pattern) ---
+    model_inputs = model.prepare_inputs_for_generation([5], **model_kwargs)
+    assert model_inputs["cache_params"] == "cache_0"
+    assert len(created_caches) == 1, "cache must be created exactly once"
+
+
+def test_patch_nemotron_cache_plumbing_skips_non_nemotron() -> None:
+    class FakeLlamaModel:
+        class config:
+            model_type = "llama"
+
+        def prepare_inputs_for_generation(self, input_ids, **kwargs):
+            return {"input_ids": input_ids}
+
+    assert _patch_nemotron_cache_plumbing(FakeLlamaModel()) is False
+
+
+class FakeStateTensor:
+    def __init__(self, device: str = "cpu") -> None:
+        self.device = device
+        self.to_calls: list[str] = []
+        self.zeroed = False
+
+    def to(self, device: str) -> "FakeStateTensor":
+        self.to_calls.append(device)
+        self.device = device
+        return self
+
+    def roll(self, shifts: int, dims: int) -> "FakeStateTensor":
+        return self
+
+    def zero_(self) -> "FakeStateTensor":
+        self.zeroed = True
+        return self
+
+    def __getitem__(self, key: object) -> "FakeStateTensor":
+        return self
+
+    def __setitem__(self, key: object, value: object) -> None:
+        self.assigned = (key, value)
+
+
+class FakeBrokenNemotronCache:
+    def __init__(self) -> None:
+        self.conv_states = [FakeStateTensor("cpu")]
+        self.ssm_states = [FakeStateTensor("cpu")]
+
+    def update_conv_state(self, layer_idx: int, new_conv_state: FakeStateTensor, cache_init: bool = False) -> FakeStateTensor:
+        if cache_init:
+            self.conv_states[layer_idx] = new_conv_state.to(self.conv_states.device)
+        else:
+            self.conv_states[layer_idx] = self.conv_states[layer_idx].roll(shifts=-1, dims=-1)
+            self.conv_states[layer_idx][:, :, -1] = new_conv_state[:, 0, :].to(self.conv_states.device)
+        return self.conv_states[layer_idx]
+
+    def update_ssm_state(self, layer_idx: int, new_ssm_state: FakeStateTensor) -> FakeStateTensor:
+        self.ssm_states[layer_idx] = new_ssm_state.to(self.ssm_states.device)
+        return self.ssm_states[layer_idx]
+
+    def reset(self) -> None:
+        self.conv_states.zero_()
+        self.ssm_states.zero_()
+
+
+def test_patch_nemotron_cache_instance_backfills_missing_cache_attributes() -> None:
+    cache = FakeBrokenNemotronCache()
+
+    assert not hasattr(cache, "conv_kernel_size")
+    assert not hasattr(cache.conv_states, "device")
+    assert not hasattr(cache.ssm_states, "device")
+
+    patched = _patch_nemotron_cache_instance(cache, DummyNemotronModelConfig())
+
+    assert patched is cache
+    assert cache.conv_kernel_size == 4
+    assert cache.conv_states.device == "cpu"
+    assert cache.ssm_states.device == "cpu"
+
+    new_conv_state = FakeStateTensor("cuda:0")
+    cache.update_conv_state(0, new_conv_state, cache_init=True)
+    assert new_conv_state.to_calls == ["cpu"]
+
+    new_ssm_state = FakeStateTensor("cuda:0")
+    cache.update_ssm_state(0, new_ssm_state)
+    assert new_ssm_state.to_calls == ["cpu"]
+
+    cache.reset()
+    assert cache.conv_states[0].zeroed is True
+    assert cache.ssm_states[0].zeroed is True
 
 
 def test_extract_thinking_trace_returns_prefix_before_pit() -> None:

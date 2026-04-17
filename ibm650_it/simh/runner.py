@@ -91,6 +91,23 @@ class PipelineResult:
         }
 
 
+
+def output_deck_has_cards(output_deck: Path | None) -> bool:
+    return bool(output_deck is not None and output_deck.exists() and output_deck.stat().st_size > 0)
+
+
+def validate_run_result(
+    run: RunResult,
+    *,
+    context: str = "run",
+    require_nonempty_output: bool = True,
+) -> None:
+    if run.status != "ok":
+        raise RuntimeError(f"{context} failed with status={run.status}")
+    if require_nonempty_output and not output_deck_has_cards(run.output_deck):
+        raise RuntimeError(f"{context} did not emit a non-empty output deck")
+
+
 class SimhRunner:
     def __init__(
         self,
@@ -288,11 +305,12 @@ class SimhRunner:
         proc = self._run_batch(workdir, "run_spit.ini", script, timeout_seconds=timeout_seconds)
         stdout_log = self._write_stdout(workdir, "run_stdout.log", proc)
         output_deck = workdir.path("run_output.dck")
+        output_path = output_deck if output_deck.exists() else None
         return RunResult(
-            status="ok" if output_deck.exists() else "run_error",
+            status="ok" if proc.returncode == 0 and output_deck_has_cards(output_path) else "run_error",
             workdir=workdir.root,
             spit_p1=workdir.path("spit_p1.dck"),
-            output_deck=output_deck if output_deck.exists() else None,
+            output_deck=output_path,
             console_log=workdir.path("run_console.log"),
             stdout_log=stdout_log,
             print_log=workdir.path("run_print.txt"),

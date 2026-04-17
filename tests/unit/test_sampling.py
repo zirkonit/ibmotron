@@ -1,6 +1,6 @@
 from collections import Counter
 
-from ibm650_it.dataset.sampling import stable_limit_records
+from ibm650_it.dataset.sampling import stable_limit_records, stable_weighted_band_sample
 
 
 def _records() -> list[dict[str, object]]:
@@ -27,5 +27,19 @@ def test_stable_limit_records_balances_across_bands() -> None:
 def test_stable_limit_records_is_deterministic() -> None:
     first = [str(record["id"]) for record in stable_limit_records(_records(), 5)]
     second = [str(record["id"]) for record in stable_limit_records(_records(), 5)]
+
+    assert first == second
+
+
+def test_stable_weighted_band_sample_biases_toward_weighted_band() -> None:
+    selected = stable_weighted_band_sample(_records(), 6, band_weights={"B0": 3})
+
+    counts = Counter(str(record["band"]) for record in selected)
+    assert counts == {"B0": 4, "B1": 1, "B2": 1}
+
+
+def test_stable_weighted_band_sample_is_deterministic() -> None:
+    first = [str(record["id"]) for record in stable_weighted_band_sample(_records(), 7, band_weights={"B2": 4})]
+    second = [str(record["id"]) for record in stable_weighted_band_sample(_records(), 7, band_weights={"B2": 4})]
 
     assert first == second

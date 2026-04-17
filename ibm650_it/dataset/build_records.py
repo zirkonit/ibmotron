@@ -143,7 +143,7 @@ def build_record(
                 "status": pipeline.run.status,
                 "input_deck": str(input_deck) if input_deck is not None else None,
                 "spit_p1": str(pipeline.spit.spit_p1),
-                "output_deck": str(pipeline.run.output_deck),
+                "output_deck": str(pipeline.run.output_deck) if pipeline.run.output_deck is not None else None,
                 "console_log": str(pipeline.run.console_log),
                 "stdout_log": str(pipeline.run.stdout_log),
                 "print_log": str(pipeline.run.print_log),

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ibm650_it.dataset.build_records import alpha_normalize_source
-from ibm650_it.generate.sample_program import generate_band_program, generate_band_sample, infer_features
+from ibm650_it.generate.sample_program import _normalize_it_read_input_deck, generate_band_program, generate_band_sample, infer_features
 from ibm650_it.source.render_it_text import render_program
 from ibm650_it.source.ast import Goto, IfGoto, Iterate, Punch, Read
 
@@ -154,3 +154,20 @@ def test_generate_b5_has_large_alpha_unique_space() -> None:
     }
 
     assert len(alpha_sources) >= 180
+
+
+def test_normalize_it_read_input_deck_emits_textual_type1_cards(tmp_path) -> None:
+    raw_output = tmp_path / "raw_output.dck"
+    raw_output.write_text(
+        "02?001000540?0000050030001000590000000500100010005000000000402000200059000000050\n",
+        encoding="latin-1",
+    )
+
+    output_path = _normalize_it_read_input_deck(raw_output, tmp_path / "input_data.it.txt")
+
+    assert output_path.read_text(encoding="latin-1") == (
+        "02+001000540?0000050\n"
+        "03+00100059000000050\n"
+        "01+00100050000000004\n"
+        "02+002000N9000000050\n"
+    )

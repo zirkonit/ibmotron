@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ibm650_it.dataset.build_records import build_record
 from ibm650_it.generate.bands import BANDS
-from ibm650_it.simh.runner import SimhRunner
+from ibm650_it.simh.runner import SimhRunner, validate_run_result
 from ibm650_it.source.ast import Add, Assign, FloatConst, Goto, Halt, IfGoto, IntConst, Iterate, Mul, Program, Punch, Read, Statement, Var
 from ibm650_it.source.render_it_card80 import render_simh_source_deck
 from ibm650_it.source.bounds import compute_header
@@ -542,6 +542,42 @@ def _write_program_artifacts(program: Program, sample_dir: Path, *, stem: str) -
     return source_path, source_deck_path, ast_path, bounds_path
 
 
+_POSITIVE_OVERPUNCH_DIGITS = "?ABCDEFGHI"
+_NEGATIVE_OVERPUNCH_DIGITS = "!JKLMNOPQR"
+
+
+def _negative_overpunch_digit(char: str) -> str:
+    if char in _NEGATIVE_OVERPUNCH_DIGITS:
+        return char
+    index = _POSITIVE_OVERPUNCH_DIGITS.find(char)
+    if index >= 0:
+        return _NEGATIVE_OVERPUNCH_DIGITS[index]
+    if char.isdigit():
+        return _NEGATIVE_OVERPUNCH_DIGITS[int(char)]
+    return "!"
+
+
+def _normalize_it_read_input_deck(raw_output_deck: Path, output_path: Path) -> Path:
+    normalized_cards: list[str] = []
+    for raw_card in raw_output_deck.read_text(encoding="latin-1").splitlines():
+        words = [raw_card[i:i+10].ljust(10) for i in range(0, len(raw_card), 10)]
+        for index in range(0, len(words) - 1, 2):
+            name_word = words[index]
+            value_word = words[index + 1]
+            if not name_word.strip() and not value_word.strip():
+                continue
+            name_chars = list(name_word)
+            name_chars[2] = "+"
+            normalized_cards.append("".join(name_chars) + value_word)
+    if not normalized_cards:
+        raise RuntimeError(f"input producer emitted no readable IT data cards: {raw_output_deck}")
+    last_name = list(normalized_cards[-1][:10])
+    last_name[9] = _negative_overpunch_digit(last_name[9])
+    normalized_cards[-1] = "".join(last_name) + normalized_cards[-1][10:]
+    output_path.write_text("\n".join(card.rstrip() for card in normalized_cards) + "\n", encoding="latin-1")
+    return output_path
+
+
 def materialize_input_deck(
     *,
     generated: GeneratedSample,
@@ -555,9 +591,11 @@ def materialize_input_deck(
         source_deck=source_deck_path,
         output_dir=sample_dir / "input_pipeline",
     )
-    if pipeline.run.output_deck is None:
+    validate_run_result(pipeline.run, context="input producer")
+    raw_output_deck = pipeline.run.output_deck
+    if raw_output_deck is None:
         raise RuntimeError("input producer did not emit a run output deck")
-    return pipeline.run.output_deck
+    return _normalize_it_read_input_deck(raw_output_deck, sample_dir / "input_data.it.txt")
 
 
 def generate_accepted_programs(
@@ -594,6 +632,7 @@ def generate_accepted_programs(
                 output_dir=sample_dir / "pipeline",
                 input_deck=input_deck,
             )
+            validate_run_result(pipeline.run, context="reference pipeline")
         except Exception as exc:
             rejection_counts[type(exc).__name__] += 1
             seed += 1

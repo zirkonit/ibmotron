@@ -19,6 +19,7 @@ from ibm650_it.generate.sample_program import generate_accepted_programs, genera
 from ibm650_it.pit.normalize_pit import canonicalize_pit_file
 from ibm650_it.simh.runner import SimhRunner
 from ibm650_it.source.render_it_text import render_program
+from ibm650_it.training.hf_qlora import DEFAULT_TRANSFORMERS_QLORA_MODEL
 from ibm650_it.training.infer import run_inference
 from ibm650_it.training.prepare_sft import BAND_REPEAT_PRESETS, prepare_sft_examples, resolve_band_repeats
 from ibm650_it.training.thinking_ablation import run_thinking_ablation
@@ -360,13 +361,14 @@ def cmd_train_eval(args: argparse.Namespace) -> None:
         max_examples=args.max_examples,
     )
 
+    requested_modes = list(args.modes or ["zero_shot", "few_shot", "fine_tuned"])
     results = {
         "records_written": records_written,
         "train": train_summary,
         "evaluations": {},
         "eval_mode": args.eval_mode,
     }
-    for mode in ["zero_shot", "few_shot", "fine_tuned"]:
+    for mode in requested_modes:
         inference_summary = run_inference(
             reference_index=eval_index,
             output_dir=output_root / "predictions" / mode,
@@ -390,6 +392,7 @@ def cmd_train_eval(args: argparse.Namespace) -> None:
             dataset_root=dataset_root,
             output_root=output_root,
             eval_split=args.eval_split,
+            modes=requested_modes,
             failure_archive_limit=args.failure_archive_limit,
             repo_root=REPO_ROOT,
             step_budget=args.step_budget,
@@ -573,7 +576,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--sft-jsonl", required=True)
     train.add_argument("--output", required=True)
     train.add_argument("--backend", default="smoke")
-    train.add_argument("--model-name", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
+    train.add_argument("--model-name", default=DEFAULT_TRANSFORMERS_QLORA_MODEL)
     train.add_argument("--qlora-bits", type=int, default=4)
     train.add_argument("--learning-rate", type=float, default=1e-4)
     train.add_argument("--epochs", type=int, default=3)
@@ -692,7 +695,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_eval.add_argument("--dataset-root", required=True)
     train_eval.add_argument("--output", required=True)
     train_eval.add_argument("--backend", default="transformers_qlora")
-    train_eval.add_argument("--model-name", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
+    train_eval.add_argument("--model-name", default=DEFAULT_TRANSFORMERS_QLORA_MODEL)
     train_eval.add_argument("--qlora-bits", type=int, default=0)
     train_eval.add_argument("--learning-rate", type=float, default=2e-4)
     train_eval.add_argument("--epochs", type=int, default=5)
@@ -702,6 +705,12 @@ def build_parser() -> argparse.ArgumentParser:
     train_eval.add_argument("--train-split", default="synthetic_train.jsonl")
     train_eval.add_argument("--eval-split", default="synthetic_dev.jsonl")
     train_eval.add_argument("--few-shot-k", type=int, default=4)
+    train_eval.add_argument(
+        "--modes",
+        nargs="+",
+        choices=["zero_shot", "few_shot", "fine_tuned"],
+        default=["zero_shot", "few_shot", "fine_tuned"],
+    )
     train_eval.add_argument("--band-repeat", action="append", default=[])
     train_eval.add_argument("--band-repeat-preset", choices=sorted(BAND_REPEAT_PRESETS))
     train_eval.add_argument("--limit", type=int)
@@ -733,7 +742,7 @@ def build_parser() -> argparse.ArgumentParser:
     smoke_train.set_defaults(
         func=cmd_train_eval,
         backend="smoke",
-        model_name="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
+        model_name=DEFAULT_TRANSFORMERS_QLORA_MODEL,
         qlora_bits=4,
         learning_rate=1e-4,
         epochs=3,
@@ -747,7 +756,7 @@ def build_parser() -> argparse.ArgumentParser:
     overfit.add_argument("--output", required=True)
     overfit.add_argument("--example-count", type=int, default=16)
     overfit.add_argument("--backend", default="transformers_qlora")
-    overfit.add_argument("--model-name", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
+    overfit.add_argument("--model-name", default=DEFAULT_TRANSFORMERS_QLORA_MODEL)
     overfit.add_argument("--qlora-bits", type=int, default=0)
     overfit.add_argument("--learning-rate", type=float, default=2e-4)
     overfit.add_argument("--epochs", type=int, default=5)

@@ -20,13 +20,16 @@ from ibm650_it import REPO_ROOT
 from ibm650_it.cloud import RunpodCtl
 from ibm650_it.dataset.io import load_jsonl, resolve_record_base, resolve_record_path
 from ibm650_it.eval.finalize import finalize_overfit_output, finalize_train_eval_output
+from ibm650_it.training.hf_qlora import DEFAULT_TRANSFORMERS_QLORA_MODEL
 
 
 ACCELERATE_VERSION = "1.10.0"
 BITSANDBYTES_VERSION = "0.47.0"
 DATASETS_VERSION = "4.0.0"
-PEFT_VERSION = "0.17.0"
+PEFT_VERSION = "0.18.1"
 TRANSFORMERS_VERSION = "4.56.0"
+# Qwen3.5 support has not landed in any PyPI release yet — install from git main.
+QWEN35_TRANSFORMERS_REQ = "transformers @ git+https://github.com/huggingface/transformers.git@main"
 MAMBA_WHEEL_URL = (
     "https://github.com/state-spaces/mamba/releases/download/v2.3.1/"
     "mamba_ssm-2.3.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
@@ -69,6 +72,21 @@ EXCLUDE_PARTS = {
     "artifacts/models",
     "artifacts/failures",
 }
+
+
+def _requires_mamba_runtime(model_name: str) -> bool:
+    return "nemotron" in model_name.lower()
+
+
+def _requires_qwen35_transformers_pin(model_name: str) -> bool:
+    normalized = model_name.lower()
+    return normalized.startswith("qwen/qwen3.5") or "/qwen3.5" in normalized
+
+
+def _transformers_requirement(model_name: str) -> str:
+    if _requires_qwen35_transformers_pin(model_name):
+        return f"'{QWEN35_TRANSFORMERS_REQ}'"
+    return f"transformers=={TRANSFORMERS_VERSION}"
 
 
 def _include_path(path: Path) -> bool:
@@ -242,6 +260,13 @@ def _base_runtime_steps() -> list[str]:
     ]
 
 
+def _dataset_refresh_steps() -> list[str]:
+    return [
+        "mkdir -p /workspace",
+        "tar --no-same-owner --no-same-permissions -xzf /workspace/ibmotron-dataset.tgz -C /workspace",
+    ]
+
+
 def _band_repeat_flags(args: argparse.Namespace) -> str:
     flags: list[str] = []
     preset = getattr(args, "band_repeat_preset", None)
@@ -252,48 +277,66 @@ def _band_repeat_flags(args: argparse.Namespace) -> str:
     return " ".join(flags)
 
 
-def remote_prepare_command() -> str:
-    return " && ".join(
-        [
-            "export DEBIAN_FRONTEND=noninteractive",
-            "apt-get update",
-            "apt-get install -y build-essential git python3-pip python3-venv",
-            "mkdir -p /workspace",
-            "mkdir -p /workspace/ibmotron",
-            f"rm -f {READY_MARKER}",
-            "rm -rf /workspace/ibmotron/.venv",
-            "tar --no-same-owner --no-same-permissions -xzf /workspace/ibmotron-base.tgz -C /workspace",
-            "tar --no-same-owner --no-same-permissions -xzf /workspace/ibmotron-dataset.tgz -C /workspace",
-            "cd /workspace/ibmotron",
-            "python3 -m venv .venv --system-site-packages",
-            ". .venv/bin/activate",
-            "export HF_HOME=/workspace/.cache/huggingface",
-            "mkdir -p \"$HF_HOME\"",
-            "python -m pip install --upgrade pip",
-            "pip install -e .",
-            (
-                "pip install "
-                f"accelerate=={ACCELERATE_VERSION} "
-                f"bitsandbytes=={BITSANDBYTES_VERSION} "
-                f"datasets=={DATASETS_VERSION} "
-                f"peft=={PEFT_VERSION} "
-                f"transformers=={TRANSFORMERS_VERSION}"
-            ),
-            f"pip install {MAMBA_WHEEL_URL}",
-            f"pip install {CAUSAL_CONV1D_WHEEL_URL}",
-            (
-                "python -c "
-                "\"import json; from pathlib import Path; "
-                f"Path({READY_MARKER!r}).write_text(json.dumps({{'ready': True}}), encoding='utf-8')\""
-            ),
-        ]
+def _mode_flags(args: argparse.Namespace) -> str:
+    modes = list(getattr(args, "modes", []) or [])
+    if not modes:
+        return ""
+    return " ".join(f"--modes {mode}" for mode in modes)
+
+
+def remote_prepare_command(model_name: str = DEFAULT_TRANSFORMERS_QLORA_MODEL) -> str:
+    steps = [
+        "export DEBIAN_FRONTEND=noninteractive",
+        "apt-get update",
+        "apt-get install -y build-essential git python3-pip python3-venv",
+        "mkdir -p /workspace",
+        "mkdir -p /workspace/ibmotron",
+        f"rm -f {READY_MARKER}",
+        "rm -rf /workspace/ibmotron/.venv",
+        "tar --no-same-owner --no-same-permissions -xzf /workspace/ibmotron-base.tgz -C /workspace",
+        "tar --no-same-owner --no-same-permissions -xzf /workspace/ibmotron-dataset.tgz -C /workspace",
+        "cd /workspace/ibmotron",
+        "python3 -m venv .venv --system-site-packages",
+        ". .venv/bin/activate",
+        "export HF_HOME=/workspace/.cache/huggingface",
+        "mkdir -p \"$HF_HOME\"",
+        "python -m pip install --upgrade pip",
+        "pip install -e .",
+        (
+            "pip install "
+            f"accelerate=={ACCELERATE_VERSION} "
+            f"bitsandbytes=={BITSANDBYTES_VERSION} "
+            f"datasets=={DATASETS_VERSION} "
+            f"peft=={PEFT_VERSION} "
+            f"{_transformers_requirement(model_name)}"
+        ),
+    ]
+    if _requires_mamba_runtime(model_name):
+        steps.extend(
+            [
+                f"pip install {MAMBA_WHEEL_URL}",
+                f"pip install {CAUSAL_CONV1D_WHEEL_URL}",
+            ]
+        )
+    steps.append(
+        (
+            "python -c "
+            "\"import json; from pathlib import Path; "
+            f"Path({READY_MARKER!r}).write_text(json.dumps({{'ready': True}}), encoding='utf-8')\""
+        )
     )
+    return " && ".join(steps)
 
 
 def remote_train_command(args: argparse.Namespace, remote_output: str, *, reuse_workspace: bool = False) -> str:
-    prefix = _base_runtime_steps() if reuse_workspace else [remote_prepare_command(), *_base_runtime_steps()]
+    prefix = (
+        [*_dataset_refresh_steps(), *_base_runtime_steps()]
+        if reuse_workspace
+        else [remote_prepare_command(args.model_name), *_base_runtime_steps()]
+    )
     max_examples, limit = resolve_dataset_caps(args)
     band_repeat_flags = _band_repeat_flags(args)
+    mode_flags = _mode_flags(args)
     batch_size = int(getattr(args, "inference_batch_size", 1) or 1)
     batch_flag = f" --inference-batch-size {batch_size}" if batch_size > 1 else ""
     if args.run_mode == "overfit-sanity":
@@ -359,6 +402,9 @@ def remote_train_command(args: argparse.Namespace, remote_output: str, *, reuse_
                 f"--per-device-train-batch-size {args.per_device_train_batch_size} "
                 f"--gradient-accumulation-steps {args.gradient_accumulation_steps} "
                 f"--few-shot-k {args.few_shot_k} "
+                f"--train-split {args.train_split} "
+                f"--eval-split {args.eval_split} "
+                + (f"{mode_flags} " if mode_flags else "")
                 + (f"{band_repeat_flags} " if band_repeat_flags else "")
                 + (f"--limit {limit} " if limit is not None else "")
                 + (f"--max-examples {max_examples} " if max_examples is not None else "")
@@ -420,6 +466,7 @@ def _job_metadata_payload(args: argparse.Namespace, *, pod_id: str, detached: bo
         "reference_index": args.reference_index,
         "eval_split": args.eval_split,
         "inference_mode": args.inference_mode,
+        "modes": list(getattr(args, "modes", []) or []),
         "remote_output": args.remote_output,
         "local_output": args.local_output,
         "band_repeat": list(getattr(args, "band_repeat", []) or []),
@@ -590,6 +637,7 @@ print(json.dumps(payload))
 
 def _finalize_local_output(args: argparse.Namespace, local_output_root: Path) -> dict[str, object]:
     subprocess.run(["./scripts/build_simh.sh"], cwd=REPO_ROOT, check=True)
+    requested_modes = list(getattr(args, "modes", []) or [])
     if args.run_mode == "overfit-sanity":
         return finalize_overfit_output(
             dataset_index=REPO_ROOT / args.dataset_index,
@@ -614,6 +662,7 @@ def _finalize_local_output(args: argparse.Namespace, local_output_root: Path) ->
         dataset_root=REPO_ROOT / f"artifacts/datasets/{args.dataset_name}",
         output_root=local_output_root,
         eval_split=args.eval_split,
+        modes=requested_modes or None,
         failure_archive_limit=args.failure_archive_limit,
         repo_root=REPO_ROOT,
         step_budget=args.step_budget,
@@ -634,6 +683,7 @@ def _hydrate_args_from_metadata(args: argparse.Namespace, *, force: bool = False
         "reference_index",
         "eval_split",
         "inference_mode",
+        "modes",
         "remote_output",
         "band_repeat",
         "band_repeat_preset",
@@ -732,7 +782,7 @@ def main() -> None:
     parser.add_argument("--dataset-index")
     parser.add_argument("--reference-index")
     parser.add_argument("--backend", default="transformers_qlora")
-    parser.add_argument("--model-name", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
+    parser.add_argument("--model-name", default=DEFAULT_TRANSFORMERS_QLORA_MODEL)
     parser.add_argument("--qlora-bits", type=int, default=REAL_BASELINE_QLORA_BITS)
     parser.add_argument("--learning-rate", type=float, default=REAL_BASELINE_LEARNING_RATE)
     parser.add_argument("--epochs", type=int, default=REAL_BASELINE_EPOCHS)
@@ -740,6 +790,12 @@ def main() -> None:
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--few-shot-k", type=int, default=4)
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=["zero_shot", "few_shot", "fine_tuned"],
+        default=["zero_shot", "few_shot", "fine_tuned"],
+    )
     parser.add_argument("--band-repeat", action="append", default=[])
     parser.add_argument("--band-repeat-preset")
     parser.add_argument("--train-split", default="synthetic_train.jsonl")
@@ -848,14 +904,15 @@ def main() -> None:
             return
         if args.prepare_only or not args.reuse_pod_workspace:
             base_archive = build_base_archive()
-            dataset_archive = build_dataset_archive(args)
             ctl.scp_to(ssh_info, base_archive, "/workspace/ibmotron-base.tgz")
+        if not args.collect_only:
+            dataset_archive = build_dataset_archive(args)
             ctl.scp_to(ssh_info, dataset_archive, "/workspace/ibmotron-dataset.tgz")
         if args.reuse_pod_workspace:
             ready = ctl.ssh(ssh_info, f"test -f {READY_MARKER}", check=False)
             if ready.returncode != 0:
                 raise SystemExit(f"remote workspace on pod {pod_id} is not prepared; missing {READY_MARKER}")
-        remote_command = remote_prepare_command() if args.prepare_only else remote_train_command(
+        remote_command = remote_prepare_command(args.model_name) if args.prepare_only else remote_train_command(
             args,
             args.remote_output,
             reuse_workspace=args.reuse_pod_workspace,

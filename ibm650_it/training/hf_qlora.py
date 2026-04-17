@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 from typing import Any
 
+
+DEFAULT_TRANSFORMERS_QLORA_MODEL = "Qwen/Qwen3.5-2B"
 
 NEMOTRON_LORA_TARGET_MODULES = [
     # The Mamba `in_proj` / `out_proj` weights are consumed by custom kernels;
@@ -15,6 +18,26 @@ NEMOTRON_LORA_TARGET_MODULES = [
     "up_proj",
     "down_proj",
 ]
+
+QWEN_LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+
+def resolve_lora_target_modules(*, model_name: str, model_config: Any) -> list[str]:
+    model_type = str(getattr(model_config, "model_type", "") or "").lower()
+    normalized_name = model_name.lower()
+    if model_type == "nemotron_h" or "nemotron" in normalized_name:
+        return NEMOTRON_LORA_TARGET_MODULES
+    if model_type.startswith("qwen") or "qwen" in normalized_name:
+        return QWEN_LORA_TARGET_MODULES
+    return QWEN_LORA_TARGET_MODULES
 
 
 def build_supervised_rows(
@@ -43,6 +66,15 @@ def build_supervised_rows(
     return rows
 
 
+def trainer_processing_kwargs(*, trainer_cls: Any, tokenizer: Any) -> dict[str, Any]:
+    params = inspect.signature(trainer_cls.__init__).parameters
+    if "processing_class" in params:
+        return {"processing_class": tokenizer}
+    if "tokenizer" in params:
+        return {"tokenizer": tokenizer}
+    return {}
+
+
 def train_hf_qlora(
     *,
     sft_path: Path,
@@ -56,6 +88,7 @@ def train_hf_qlora(
         from datasets import Dataset
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
         from transformers import (
+            AutoConfig,
             AutoModelForCausalLM,
             AutoTokenizer,
             BitsAndBytesConfig,
@@ -75,6 +108,7 @@ def train_hf_qlora(
     if not records:
         raise ValueError(f"no training records found in {sft_path}")
 
+    model_config = AutoConfig.from_pretrained(config.model_name, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -109,13 +143,17 @@ def train_hf_qlora(
         model = prepare_model_for_kbit_training(model)
     elif hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
+    target_modules = resolve_lora_target_modules(
+        model_name=config.model_name,
+        model_config=getattr(model, "config", model_config),
+    )
     lora = LoraConfig(
         r=config.lora_rank,
         lora_alpha=config.lora_alpha,
         lora_dropout=config.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=NEMOTRON_LORA_TARGET_MODULES,
+        target_modules=target_modules,
     )
     model = get_peft_model(model, lora)
 
@@ -142,11 +180,14 @@ def train_hf_qlora(
         model=model,
         args=args,
         train_dataset=tokenized,
-        tokenizer=tokenizer,
         data_collator=DataCollatorForSeq2Seq(
             tokenizer=tokenizer,
             padding=True,
             label_pad_token_id=-100,
+        ),
+        **trainer_processing_kwargs(
+            trainer_cls=Trainer,
+            tokenizer=tokenizer,
         ),
     )
     trainer.train(resume_from_checkpoint=str(resume_from) if resume_from is not None else None)
@@ -166,7 +207,7 @@ def train_hf_qlora(
         "checkpoint_dir": str(output_dir / "checkpoints"),
         "example_count": len(records),
         "sft_path": str(sft_path),
-        "target_modules": NEMOTRON_LORA_TARGET_MODULES,
+        "target_modules": target_modules,
     }
     model_path = output_dir / "model.json"
     model_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")

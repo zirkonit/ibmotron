@@ -11,7 +11,7 @@ from ibm650_it.eval.exact_match import compare_pit_files
 from ibm650_it.eval.failure_taxonomy import classify_failure, should_attempt_assembly
 from ibm650_it.eval.functional import compare_run_outputs
 from ibm650_it.simh.deckio import split_tail_cards
-from ibm650_it.simh.runner import SimhRunner
+from ibm650_it.simh.runner import SimhRunner, output_deck_has_cards
 
 
 def _error_payload(exc: BaseException) -> dict[str, str]:
@@ -22,9 +22,17 @@ def _error_payload(exc: BaseException) -> dict[str, str]:
     }
 
 
-def _reference_has_successful_run(reference: dict[str, Any]) -> bool:
+def _reference_output_path(reference: dict[str, Any], reference_base: Path) -> Path | None:
+    output_deck = reference.get("reference", {}).get("run", {}).get("output_deck")
+    if not output_deck:
+        return None
+    return resolve_record_path(str(output_deck), reference_base)
+
+
+def _reference_has_successful_run(reference: dict[str, Any], reference_base: Path) -> bool:
     run = reference.get("reference", {}).get("run", {})
-    return bool(run.get("status") == "ok" and run.get("output_deck"))
+    reference_output = _reference_output_path(reference, reference_base)
+    return bool(run.get("status") == "ok" and output_deck_has_cards(reference_output))
 
 
 def _invariant_payload(code: str, message: str) -> dict[str, str]:
@@ -173,8 +181,14 @@ def reevaluate_prediction_records(
                     timeout_seconds=timeout_seconds,
                 )
                 run_status = run.status
-                reference_output = resolve_record_path(str(reference["reference"]["run"]["output_deck"]), reference_base)
-                functional = run.status == "ok" and run.output_deck is not None and compare_run_outputs(reference_output, run.output_deck)
+                reference_output = _reference_output_path(reference, reference_base)
+                functional = (
+                    reference_output is not None
+                    and output_deck_has_cards(reference_output)
+                    and run.status == "ok"
+                    and output_deck_has_cards(run.output_deck)
+                    and compare_run_outputs(reference_output, run.output_deck)
+                )
                 run_payload.update(
                     {
                         "spit_p1": str(run.spit_p1),
@@ -188,7 +202,7 @@ def reevaluate_prediction_records(
                 run_status = "run_error"
                 run_payload.update(_error_payload(exc))
 
-        if evaluator_invariant is None and bool(exact_metrics["exact_match"]) and _reference_has_successful_run(reference) and not functional:
+        if evaluator_invariant is None and bool(exact_metrics["exact_match"]) and _reference_has_successful_run(reference, reference_base) and not functional:
             evaluator_invariant = _invariant_payload(
                 "exact_match_failed_functional_check",
                 "Exact PIT match did not complete a matching local functional run.",

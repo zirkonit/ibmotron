@@ -51,6 +51,8 @@ def test_remote_train_command_uses_no_same_owner() -> None:
     assert "./scripts/build_simh.sh" not in command
     assert "--eval-mode skip" in command
     assert "--band-repeat-preset b45_focus --band-repeat B2=2 --band-repeat B3=3" in command
+    assert "--train-split synthetic_train.jsonl" in command
+    assert "--eval-split synthetic_dev.jsonl" in command
 
 
 def test_remote_prepare_command_bootstraps_runtime_only() -> None:
@@ -62,6 +64,22 @@ def test_remote_prepare_command_bootstraps_runtime_only() -> None:
     assert "python -m ibm650_it.cli overfit-sanity" not in command
     assert runpod_train_eval.READY_MARKER in command
     assert "python - <<" not in command
+
+
+def test_remote_prepare_command_uses_qwen_transformers_requirement_without_mamba_wheels() -> None:
+    command = runpod_train_eval.remote_prepare_command("Qwen/Qwen3.5-2B")
+
+    assert runpod_train_eval.QWEN35_TRANSFORMERS_REQ in command
+    assert runpod_train_eval.MAMBA_WHEEL_URL not in command
+    assert runpod_train_eval.CAUSAL_CONV1D_WHEEL_URL not in command
+
+
+def test_remote_prepare_command_keeps_mamba_runtime_for_nemotron() -> None:
+    command = runpod_train_eval.remote_prepare_command("nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
+
+    assert f"transformers=={runpod_train_eval.TRANSFORMERS_VERSION}" in command
+    assert runpod_train_eval.MAMBA_WHEEL_URL in command
+    assert runpod_train_eval.CAUSAL_CONV1D_WHEEL_URL in command
 
 
 def test_remote_train_command_reuse_workspace_skips_bootstrap() -> None:
@@ -92,7 +110,8 @@ def test_remote_train_command_reuse_workspace_skips_bootstrap() -> None:
     command = runpod_train_eval.remote_train_command(args, "artifacts/eval_reports/out", reuse_workspace=True)
 
     assert "ibmotron-base.tgz" not in command
-    assert "ibmotron-dataset.tgz" not in command
+    assert "ibmotron-dataset.tgz" in command
+    assert "tar --no-same-owner --no-same-permissions -xzf /workspace/ibmotron-dataset.tgz -C /workspace" in command
     assert "apt-get update" not in command
     assert "cd /workspace/ibmotron" in command
     assert "python -m ibm650_it.cli train-eval" in command
@@ -192,6 +211,71 @@ def test_remote_train_command_omits_inference_batch_size_flag_when_one() -> None
     # Omit the flag entirely when batch_size is 1 so we don't churn the remote
     # command fingerprint for existing resumable runs.
     assert "--inference-batch-size" not in command
+
+
+def test_remote_train_command_can_request_fine_tuned_only_mode() -> None:
+    args = argparse.Namespace(
+        run_mode="train-eval",
+        dataset_name="stage_20k_repaired",
+        dataset_index=None,
+        backend="transformers_qlora",
+        model_name="Qwen/Qwen3.5-2B",
+        qlora_bits=4,
+        learning_rate=2e-4,
+        epochs=5,
+        max_seq_length=4096,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
+        few_shot_k=4,
+        modes=["fine_tuned"],
+        train_split="synthetic_train.jsonl",
+        eval_split="synthetic_dev.jsonl",
+        limit=108,
+        max_examples=1000,
+        max_new_tokens=2048,
+        inference_batch_size=4,
+        failure_archive_limit=25,
+        step_budget="50M",
+        timeout_seconds=30,
+        example_count=32,
+    )
+
+    command = runpod_train_eval.remote_train_command(args, "artifacts/eval_reports/out", reuse_workspace=True)
+
+    assert "--modes fine_tuned" in command
+    assert "--modes zero_shot" not in command
+    assert "--modes few_shot" not in command
+
+
+def test_remote_train_command_forwards_progressive_eval_split() -> None:
+    args = argparse.Namespace(
+        run_mode="train-eval",
+        dataset_name="stage_20k_repaired",
+        dataset_index=None,
+        backend="transformers_qlora",
+        model_name="Qwen/Qwen3.5-2B",
+        qlora_bits=4,
+        learning_rate=2e-4,
+        epochs=5,
+        max_seq_length=4096,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
+        few_shot_k=4,
+        modes=["fine_tuned"],
+        train_split="synthetic_train.jsonl",
+        eval_split="progressive_eval.jsonl",
+        limit=12,
+        max_examples=100,
+        max_new_tokens=2048,
+        inference_batch_size=4,
+        failure_archive_limit=25,
+        step_budget="50M",
+        timeout_seconds=30,
+        example_count=32,
+    )
+    command = runpod_train_eval.remote_train_command(args, "artifacts/eval_reports/out", reuse_workspace=True)
+    assert "--eval-split progressive_eval.jsonl" in command
+    assert "--train-split synthetic_train.jsonl" in command
 
 
 def test_remote_inference_only_command_resumes_fine_tuned_predictions() -> None:

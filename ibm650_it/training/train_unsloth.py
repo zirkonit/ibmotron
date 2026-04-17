@@ -5,14 +5,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from ibm650_it.training.hf_qlora import train_hf_qlora
+from ibm650_it.training.hf_qlora import DEFAULT_TRANSFORMERS_QLORA_MODEL, train_hf_qlora
 from ibm650_it.training.smoke_model import train_smoke_model
 
 
 @dataclass(slots=True)
 class TrainConfig:
     backend: str = "smoke"
-    model_name: str = "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16"
+    model_name: str = DEFAULT_TRANSFORMERS_QLORA_MODEL
     qlora_bits: int = 4
     lora_rank: int = 32
     lora_alpha: int = 64
